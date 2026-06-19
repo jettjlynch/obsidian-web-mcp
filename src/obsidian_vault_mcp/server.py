@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
+from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
 from .frontmatter_index import FrontmatterIndex
 
 logger = logging.getLogger(__name__)
@@ -44,8 +44,9 @@ mcp = FastMCP(
             "127.0.0.1:*",
             "localhost:*",
             "[::1]:*",
-            # Add your tunnel hostname here, e.g.:
-            # "vault-mcp.example.com",
+            # Mac Mini ngrok reserved domain (added 2026-05-22):
+            "gigabyte-widget-elevating.ngrok-free.dev",
+            "gigabyte-widget-elevating.ngrok-free.dev:*",
         ],
     ),
 )
@@ -53,13 +54,31 @@ mcp = FastMCP(
 
 # --- Register all tools ---
 
-from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read
-from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
+from .tools.read import (
+    vault_read as _vault_read,
+    vault_batch_read as _vault_batch_read,
+    vault_read_section as _vault_read_section,
+)
+from .tools.write import vault_write as _vault_write, vault_append as _vault_append, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
+from .tools.edit import (
+    vault_find_replace as _vault_find_replace,
+    vault_insert_at as _vault_insert_at,
+    vault_replace_section as _vault_replace_section,
+    vault_append_under_heading as _vault_append_under_heading,
+    vault_prepend as _vault_prepend,
+)
+from .tools.graph import (
+    vault_links as _vault_links,
+    vault_backlinks as _vault_backlinks,
+    vault_tags as _vault_tags,
+    vault_daily as _vault_daily,
+)
 from .models import (
     VaultReadInput,
     VaultWriteInput,
+    VaultAppendInput,
     VaultBatchReadInput,
     VaultBatchFrontmatterUpdateInput,
     VaultSearchInput,
@@ -67,6 +86,16 @@ from .models import (
     VaultListInput,
     VaultMoveInput,
     VaultDeleteInput,
+    VaultFindReplaceInput,
+    VaultInsertAtInput,
+    VaultReplaceSectionInput,
+    VaultAppendUnderHeadingInput,
+    VaultPrependInput,
+    VaultReadSectionInput,
+    VaultLinksInput,
+    VaultBacklinksInput,
+    VaultTagsInput,
+    VaultDailyInput,
 )
 
 
@@ -97,10 +126,21 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     description="Write a file to the Obsidian vault. Supports frontmatter merging with existing files. Creates parent directories by default.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
-    """Write a file to the vault."""
-    inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False, dry_run: bool = False) -> str:
+    """Write a file to the vault. Set dry_run=true to preview a diff without writing."""
+    inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter, dry_run=dry_run)
+    return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter, inp.dry_run)
+
+
+@mcp.tool(
+    name="vault_append",
+    description="Append content to the end of a file in the vault without overwriting existing content. Creates the file if it doesn't exist. Prefer this over vault_write when adding to an existing note, to avoid clobbering its contents.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_append(path: str, content: str, create_dirs: bool = True, ensure_newline: bool = True, dry_run: bool = False) -> str:
+    """Append content to a vault file. Set dry_run=true to preview a diff without writing."""
+    inp = VaultAppendInput(path=path, content=content, create_dirs=create_dirs, ensure_newline=ensure_newline, dry_run=dry_run)
+    return _vault_append(inp.path, inp.content, inp.create_dirs, inp.ensure_newline, inp.dry_run)
 
 
 @mcp.tool(
@@ -108,10 +148,10 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
     description="Update YAML frontmatter fields on multiple files without changing body content. Each update merges new fields into existing frontmatter.",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def vault_batch_frontmatter_update(updates: list[dict]) -> str:
-    """Batch update frontmatter fields."""
-    inp = VaultBatchFrontmatterUpdateInput(updates=updates)
-    return _vault_batch_frontmatter_update(inp.updates)
+def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -> str:
+    """Batch update frontmatter fields. Set dry_run=true to preview diffs without writing."""
+    inp = VaultBatchFrontmatterUpdateInput(updates=updates, dry_run=dry_run)
+    return _vault_batch_frontmatter_update(inp.updates, inp.dry_run)
 
 
 @mcp.tool(
@@ -187,6 +227,122 @@ def vault_delete(path: str, confirm: bool = False) -> str:
     return _vault_delete(inp.path, inp.confirm)
 
 
+# --- Tier 1: surgical edits ---
+
+@mcp.tool(
+    name="vault_find_replace",
+    description="Replace an exact string in a file. occurrence='all' (default), 'first', or an integer N for the Nth match. Errors if the string is absent. Set dry_run=true to preview a unified diff without writing. Use this instead of rewriting a whole file.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_find_replace(path: str, find: str, replace: str, occurrence: str | int = "all", dry_run: bool = False) -> str:
+    """Surgically replace an exact string."""
+    inp = VaultFindReplaceInput(path=path, find=find, replace=replace, occurrence=occurrence, dry_run=dry_run)
+    return _vault_find_replace(inp.path, inp.find, inp.replace, inp.occurrence, inp.dry_run)
+
+
+@mcp.tool(
+    name="vault_insert_at",
+    description="Insert content relative to an anchor. Provide exactly one of after_heading (e.g. '## Status') or after_line (exact line). position='after' (default) or 'before' (use before + the first line to insert at the very top). Set dry_run=true to preview.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_insert_at(path: str, content: str, after_heading: str | None = None, after_line: str | None = None, position: str = "after", dry_run: bool = False) -> str:
+    """Insert content at a heading/line anchor."""
+    inp = VaultInsertAtInput(path=path, content=content, after_heading=after_heading, after_line=after_line, position=position, dry_run=dry_run)
+    return _vault_insert_at(inp.path, inp.content, inp.after_heading, inp.after_line, inp.position, inp.dry_run)
+
+
+@mcp.tool(
+    name="vault_replace_section",
+    description="Replace everything under a markdown heading (e.g. '## Status') up to the next heading of the same or higher level. The heading line itself is preserved. Set dry_run=true to preview a unified diff without writing.",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_replace_section(path: str, heading: str, new_content: str, dry_run: bool = False) -> str:
+    """Replace a section body, keeping the heading."""
+    inp = VaultReplaceSectionInput(path=path, heading=heading, new_content=new_content, dry_run=dry_run)
+    return _vault_replace_section(inp.path, inp.heading, inp.new_content, inp.dry_run)
+
+
+# --- Tier 2: section-aware read/write ---
+
+@mcp.tool(
+    name="vault_append_under_heading",
+    description="Append content to the END of the section under a heading (before the next same/higher heading), not the end of the whole file. Set dry_run=true to preview.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_append_under_heading(path: str, heading: str, content: str, dry_run: bool = False) -> str:
+    """Append to the end of a heading's section."""
+    inp = VaultAppendUnderHeadingInput(path=path, heading=heading, content=content, dry_run=dry_run)
+    return _vault_append_under_heading(inp.path, inp.heading, inp.content, inp.dry_run)
+
+
+@mcp.tool(
+    name="vault_read_section",
+    description="Return ONLY the content under a heading (up to the next same/higher heading). Saves context on large files where you need one section, not the whole note.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_read_section(path: str, heading: str) -> str:
+    """Read one section of a file."""
+    inp = VaultReadSectionInput(path=path, heading=heading)
+    return _vault_read_section(inp.path, inp.heading)
+
+
+@mcp.tool(
+    name="vault_prepend",
+    description="Add content to the very top of a file, AFTER any YAML frontmatter block (frontmatter is preserved). Set dry_run=true to preview.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_prepend(path: str, content: str, dry_run: bool = False, create_dirs: bool = True) -> str:
+    """Prepend content after frontmatter."""
+    inp = VaultPrependInput(path=path, content=content, dry_run=dry_run, create_dirs=create_dirs)
+    return _vault_prepend(inp.path, inp.content, inp.dry_run, inp.create_dirs)
+
+
+# --- Tier 3: graph + convenience ---
+
+@mcp.tool(
+    name="vault_links",
+    description="Return all [[wikilinks]] found in a file (outgoing links), with alias/subpath parsed and a deduped list of unique targets.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_links(path: str) -> str:
+    """List a file's outgoing wikilinks."""
+    inp = VaultLinksInput(path=path)
+    return _vault_links(inp.path)
+
+
+@mcp.tool(
+    name="vault_backlinks",
+    description="Return all notes in the vault that link to `target` (incoming links) -- the graph view Obsidian has natively. target may be given with or without a .md suffix or folder path.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_backlinks(target: str) -> str:
+    """Find notes linking to a target."""
+    inp = VaultBacklinksInput(target=target)
+    return _vault_backlinks(inp.target)
+
+
+@mcp.tool(
+    name="vault_tags",
+    description="If tag is given: list all notes carrying that tag (frontmatter or inline #tag). If omitted: return all tags in the vault with counts, sorted by frequency.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_tags(tag: str | None = None) -> str:
+    """List notes by tag, or all tags with counts."""
+    inp = VaultTagsInput(tag=tag)
+    return _vault_tags(inp.tag)
+
+
+@mcp.tool(
+    name="vault_daily",
+    description="Resolve today's Daily/YYYY-MM-DD.md (Europe/London). Creates it with the standard daily header if missing. If content is given, appends it (under heading if provided, else end of file). If no content, returns today's daily note. Set dry_run=true to preview any create/append.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_daily(content: str | None = None, heading: str | None = None, dry_run: bool = False) -> str:
+    """Resolve/create/append/read today's daily note."""
+    inp = VaultDailyInput(content=content, heading=heading, dry_run=dry_run)
+    return _vault_daily(inp.content, inp.heading, inp.dry_run)
+
+
 def main():
     """Entry point. Run with streamable HTTP transport."""
     logging.basicConfig(
@@ -198,6 +354,19 @@ def main():
     if not VAULT_PATH.is_dir():
         logger.error(f"Vault path does not exist: {VAULT_PATH}")
         sys.exit(1)
+
+    if VAULT_SCOPE_ROOT:
+        try:
+            scoped = effective_vault_path()
+        except ValueError as e:
+            logger.error(f"Invalid VAULT_SCOPE_ROOT: {e}")
+            sys.exit(1)
+        if not scoped.is_dir():
+            logger.error(f"VAULT_SCOPE_ROOT folder does not exist: {scoped}")
+            sys.exit(1)
+        logger.warning(f"SCOPED MODE: access locked to sub-folder {VAULT_SCOPE_ROOT!r} ({scoped})")
+    else:
+        logger.info(f"Full-access mode: vault root {VAULT_PATH}")
 
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")

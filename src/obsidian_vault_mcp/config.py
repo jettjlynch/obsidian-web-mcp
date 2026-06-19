@@ -6,6 +6,31 @@ VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/My
 VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 
+# Optional folder-scoping. When VAULT_SCOPE_ROOT names a sub-folder of the vault,
+# this server instance is locked to that sub-folder: it becomes the effective vault
+# root and every tool refuses any path resolving outside it. Unset = full vault.
+VAULT_SCOPE_ROOT = os.environ.get("VAULT_SCOPE_ROOT", "").strip().strip("/")
+
+
+def effective_vault_path() -> "Path":
+    """Root that every tool treats as 'the vault'.
+
+    Returns VAULT_PATH unchanged in full-access mode. When VAULT_SCOPE_ROOT is set,
+    returns VAULT_PATH/VAULT_SCOPE_ROOT and that sub-path becomes the root used for
+    resolution, listing, search, and the frontmatter index. The scope itself must
+    name a folder inside the vault (no absolute path, no '..' escape) or this raises.
+    """
+    if not VAULT_SCOPE_ROOT:
+        return VAULT_PATH
+
+    base = VAULT_PATH.resolve()
+    scoped = (base / VAULT_SCOPE_ROOT).resolve()
+    if scoped != base and not str(scoped).startswith(str(base) + os.sep):
+        raise ValueError(
+            f"VAULT_SCOPE_ROOT {VAULT_SCOPE_ROOT!r} resolves outside the vault root"
+        )
+    return scoped
+
 # OAuth 2.0 client credentials (for Claude app integration)
 VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")

@@ -27,8 +27,8 @@ def resolve_vault_path(relative_path: str) -> Path:
                 f"Path component '{part}' starts with '.'; dotfiles and hidden directories are not allowed"
             )
 
-    resolved = (config.VAULT_PATH / relative_path).resolve()
-    vault_root = config.VAULT_PATH.resolve()
+    vault_root = config.effective_vault_path().resolve()
+    resolved = (vault_root / relative_path).resolve()
 
     if not str(resolved).startswith(str(vault_root) + os.sep) and resolved != vault_root:
         raise ValueError("Path resolves outside the vault root")
@@ -137,7 +137,7 @@ def delete_path(relative_path: str) -> bool:
     if path.is_dir() and any(path.iterdir()):
         raise ValueError(f"Refusing to delete non-empty directory: {relative_path}")
 
-    trash_dir = config.VAULT_PATH.resolve() / ".trash"
+    trash_dir = config.effective_vault_path().resolve() / ".trash"
     trash_dir.mkdir(exist_ok=True)
 
     dest = trash_dir / path.name
@@ -169,7 +169,7 @@ def list_directory(
     if not root.is_dir():
         raise NotADirectoryError(f"Not a directory: {relative_path}")
 
-    vault_root = config.VAULT_PATH.resolve()
+    vault_root = config.effective_vault_path().resolve()
     results: list[dict] = []
 
     def _walk(dir_path: Path, current_depth: int) -> None:

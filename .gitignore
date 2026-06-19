@@ -8,3 +8,4 @@ wheels/
 .venv/
 .env
 uv.lock
+.claude-flow/

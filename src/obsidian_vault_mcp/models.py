@@ -51,6 +51,40 @@ class VaultWriteInput(BaseModel):
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
     )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, return a unified diff of what WOULD change and write nothing",
+    )
+
+
+class VaultAppendInput(BaseModel):
+    """Append content to the end of a file in the vault."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    content: str = Field(
+        ...,
+        description="Content to append to the end of the file",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    create_dirs: bool = Field(
+        default=True,
+        description="Create the file (and parent directories) if it doesn't exist",
+    )
+    ensure_newline: bool = Field(
+        default=True,
+        description="If true, ensure a newline separates existing content from the appended content",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, return a unified diff of what WOULD change and write nothing",
+    )
 
 
 class VaultListInput(BaseModel):
@@ -221,6 +255,11 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
         max_length=MAX_BATCH_SIZE,
     )
 
+    dry_run: bool = Field(
+        default=False,
+        description="If true, return a unified diff per file and write nothing",
+    )
+
     @field_validator("updates")
     @classmethod
     def validate_updates(cls, v: list[dict]) -> list[dict]:
@@ -230,3 +269,145 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
             if "fields" not in item or not isinstance(item["fields"], dict):
                 raise ValueError(f"updates[{i}] must contain a 'fields' key with a dict value")
         return v
+
+
+# ----------------------------------------------------------------------------
+# Surgical edit, section, and graph tools (added 2026-06-17)
+#
+# These models deliberately OMIT str_strip_whitespace: surgical edits must keep
+# exact leading/trailing whitespace and newlines in find/replace targets and in
+# inserted content, or the edit corrupts the file. Read-only models that only
+# carry a path/heading may strip.
+# ----------------------------------------------------------------------------
+
+_DRY_RUN = Field(
+    default=False,
+    description="If true, return a unified diff of what WOULD change and write nothing",
+)
+
+
+class VaultFindReplaceInput(BaseModel):
+    """Replace an exact string in a file."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    find: str = Field(..., description="Exact string to find (whitespace-sensitive)", min_length=1, max_length=MAX_CONTENT_SIZE)
+    replace: str = Field(..., description="Replacement string", max_length=MAX_CONTENT_SIZE)
+    occurrence: str | int = Field(
+        default="all",
+        description="'all', 'first', or a 1-based integer N to replace only the Nth match",
+    )
+    dry_run: bool = _DRY_RUN
+
+
+class VaultInsertAtInput(BaseModel):
+    """Insert content relative to a heading or exact-line anchor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    content: str = Field(..., description="Content to insert", max_length=MAX_CONTENT_SIZE)
+    after_heading: str | None = Field(
+        default=None,
+        description="Heading anchor, e.g. '## Living Brain Protocol'. Provide this OR after_line.",
+        max_length=500,
+    )
+    after_line: str | None = Field(
+        default=None,
+        description="Exact line to anchor to. Provide this OR after_heading.",
+        max_length=2000,
+    )
+    position: Literal["after", "before"] = Field(
+        default="after",
+        description="Insert after or before the anchor (use before + first line to insert at the very top)",
+    )
+    dry_run: bool = _DRY_RUN
+
+
+class VaultReplaceSectionInput(BaseModel):
+    """Replace the body under a heading, preserving the heading line."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    heading: str = Field(..., description="Heading whose body to replace, e.g. '## Status'", min_length=1, max_length=500)
+    new_content: str = Field(..., description="New body for the section (heading line is kept)", max_length=MAX_CONTENT_SIZE)
+    dry_run: bool = _DRY_RUN
+
+
+class VaultAppendUnderHeadingInput(BaseModel):
+    """Append content to the end of a section under a heading."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    heading: str = Field(..., description="Heading whose section to append to, e.g. '## Log'", min_length=1, max_length=500)
+    content: str = Field(..., description="Content to append at the end of the section", max_length=MAX_CONTENT_SIZE)
+    dry_run: bool = _DRY_RUN
+
+
+class VaultPrependInput(BaseModel):
+    """Insert content at the top of a file, after any YAML frontmatter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    content: str = Field(..., description="Content to place at the top (after frontmatter)", max_length=MAX_CONTENT_SIZE)
+    dry_run: bool = _DRY_RUN
+    create_dirs: bool = Field(default=True, description="Create the file/dirs if missing")
+
+
+class VaultReadSectionInput(BaseModel):
+    """Read only the body under a heading."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    heading: str = Field(..., description="Heading whose body to return, e.g. '## Status'", min_length=1, max_length=500)
+
+
+class VaultLinksInput(BaseModel):
+    """List outgoing [[wikilinks]] in a file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+
+
+class VaultBacklinksInput(BaseModel):
+    """Find all notes linking to a target."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    target: str = Field(..., description="Note name to find backlinks for (with or without .md)", min_length=1, max_length=500)
+
+
+class VaultTagsInput(BaseModel):
+    """List notes for a tag, or all tags with counts."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    tag: str | None = Field(
+        default=None,
+        description="Tag to list notes for (with or without leading #). Omit for all tags with counts.",
+        max_length=200,
+    )
+
+
+class VaultDailyInput(BaseModel):
+    """Resolve, create, append to, or read today's daily note."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str | None = Field(
+        default=None,
+        description="Content to append to today's daily note. Omit to just read it.",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    heading: str | None = Field(
+        default=None,
+        description="If appending, the heading to append under (created if absent). Else appends at end.",
+        max_length=500,
+    )
+    dry_run: bool = _DRY_RUN

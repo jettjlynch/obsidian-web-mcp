@@ -29,10 +29,10 @@ class FrontmatterIndex:
         t0 = time.monotonic()
         count = 0
 
-        for md_path in config.VAULT_PATH.rglob("*.md"):
+        for md_path in config.effective_vault_path().rglob("*.md"):
             if self._is_excluded(md_path):
                 continue
-            rel = str(md_path.relative_to(config.VAULT_PATH))
+            rel = str(md_path.relative_to(config.effective_vault_path()))
             fm = self._parse_frontmatter(md_path)
             if fm is not None:
                 self._index[rel] = fm
@@ -45,7 +45,7 @@ class FrontmatterIndex:
 
         self._observer = Observer()
         handler = _VaultEventHandler(self)
-        self._observer.schedule(handler, str(config.VAULT_PATH), recursive=True)
+        self._observer.schedule(handler, str(config.effective_vault_path()), recursive=True)
         self._observer.start()
 
     def stop(self) -> None:
@@ -101,7 +101,7 @@ class FrontmatterIndex:
 
     def _is_excluded(self, path: Path) -> bool:
         """Check whether any path component is in config.EXCLUDED_DIRS."""
-        return bool(config.EXCLUDED_DIRS & set(path.relative_to(config.VAULT_PATH).parts))
+        return bool(config.EXCLUDED_DIRS & set(path.relative_to(config.effective_vault_path()).parts))
 
     def _parse_frontmatter(self, path: Path) -> dict | None:
         """Parse YAML frontmatter from a markdown file. Returns None on failure."""
@@ -132,7 +132,7 @@ class FrontmatterIndex:
 
         for abs_path_str in paths:
             abs_path = Path(abs_path_str)
-            rel = str(abs_path.relative_to(config.VAULT_PATH))
+            rel = str(abs_path.relative_to(config.effective_vault_path()))
             if abs_path.exists():
                 fm = self._parse_frontmatter(abs_path)
                 with self._lock:

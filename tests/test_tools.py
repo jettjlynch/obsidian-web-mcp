@@ -5,7 +5,7 @@ import json
 import pytest
 
 from obsidian_vault_mcp.tools.read import vault_read, vault_batch_read
-from obsidian_vault_mcp.tools.write import vault_write, vault_batch_frontmatter_update
+from obsidian_vault_mcp.tools.write import vault_write, vault_append, vault_batch_frontmatter_update
 from obsidian_vault_mcp.tools.search import vault_search
 from obsidian_vault_mcp.tools.manage import vault_list, vault_delete
 
@@ -25,6 +25,24 @@ def test_vault_write_creates_file(vault_dir):
     assert result["created"] is True
     assert result["size"] > 0
     assert (vault_dir / "tools-test.md").exists()
+
+
+def test_vault_append_creates_file_when_missing(vault_dir):
+    """vault_append creates the file if it doesn't exist."""
+    result = json.loads(vault_append("append-new.md", "first line"))
+    assert result["created"] is True
+    assert (vault_dir / "append-new.md").read_text() == "first line"
+
+
+def test_vault_append_preserves_existing_content(vault_dir):
+    """vault_append adds to the end without clobbering existing content."""
+    result = json.loads(vault_append("no-frontmatter.md", "appended line"))
+    assert result["created"] is False
+    text = (vault_dir / "no-frontmatter.md").read_text()
+    # Original content is intact and the new content follows on its own line
+    assert text.startswith("Just plain text, no frontmatter here.\n")
+    assert text.endswith("appended line")
+    assert "Just plain text, no frontmatter here.\nappended line" == text
 
 
 def test_vault_write_merge_frontmatter(vault_dir):

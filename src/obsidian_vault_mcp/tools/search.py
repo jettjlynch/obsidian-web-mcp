@@ -54,7 +54,7 @@ def _search_ripgrep(
             match_data = data["data"]
             file_path = match_data["path"]["text"]
             try:
-                rel_path = str(Path(file_path).relative_to(config.VAULT_PATH))
+                rel_path = str(Path(file_path).relative_to(config.effective_vault_path()))
             except ValueError:
                 continue
 
@@ -109,7 +109,7 @@ def _search_python(
                 context = "\n".join(lines[start:end])
 
                 try:
-                    rel_path = str(file_path.relative_to(config.VAULT_PATH))
+                    rel_path = str(file_path.relative_to(config.effective_vault_path()))
                 except ValueError:
                     continue
 
@@ -150,7 +150,7 @@ def vault_search(
         if path_prefix:
             search_path = resolve_vault_path(path_prefix)
         else:
-            search_path = config.VAULT_PATH
+            search_path = config.effective_vault_path()
 
         if not search_path.is_dir():
             return json.dumps({"error": f"Search path is not a directory: {path_prefix}"})
@@ -161,7 +161,7 @@ def vault_search(
             matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
 
         for match in matches:
-            file_full_path = config.VAULT_PATH / match["path"]
+            file_full_path = config.effective_vault_path() / match["path"]
             match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
 
         truncated = len(matches) >= max_results
