@@ -139,6 +139,14 @@ class VaultMoveInput(BaseModel):
         default=True,
         description="Create destination parent directories if they don't exist",
     )
+    confirm: bool = Field(
+        default=False,
+        description="Must be true to execute the move -- safety gate to prevent accidental relocations. Unlike vault_delete, a move has no .trash/ recovery.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, report whether the move would succeed without touching anything. Does not require confirm.",
+    )
 
 
 class VaultDeleteInput(BaseModel):

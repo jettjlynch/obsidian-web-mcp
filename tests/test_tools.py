@@ -7,7 +7,7 @@ import pytest
 from obsidian_vault_mcp.tools.read import vault_read, vault_batch_read
 from obsidian_vault_mcp.tools.write import vault_write, vault_append, vault_batch_frontmatter_update
 from obsidian_vault_mcp.tools.search import vault_search
-from obsidian_vault_mcp.tools.manage import vault_list, vault_delete
+from obsidian_vault_mcp.tools.manage import vault_list, vault_delete, vault_move
 
 
 def test_vault_read_returns_frontmatter(vault_dir):
@@ -92,3 +92,47 @@ def test_vault_delete_requires_confirm(vault_dir):
     result = json.loads(vault_delete("delete-me.md", confirm=False))
     assert "error" in result
     assert (vault_dir / "delete-me.md").exists()  # still there
+
+
+def test_vault_move_requires_confirm(vault_dir):
+    """vault_move without confirm=true returns error and does not move."""
+    vault_write("move-me.md", "temp content")
+    result = json.loads(vault_move("move-me.md", "moved.md", confirm=False))
+    assert "error" in result
+    assert (vault_dir / "move-me.md").exists()  # still there
+    assert not (vault_dir / "moved.md").exists()
+
+
+def test_vault_move_with_confirm_moves_file(vault_dir):
+    """vault_move with confirm=true actually moves the file."""
+    vault_write("move-me-2.md", "temp content")
+    result = json.loads(vault_move("move-me-2.md", "moved-2.md", confirm=True))
+    assert "error" not in result
+    assert result["moved"] is True
+    assert not (vault_dir / "move-me-2.md").exists()
+    assert (vault_dir / "moved-2.md").exists()
+
+
+def test_vault_move_dry_run_previews_without_moving(vault_dir):
+    """vault_move with dry_run=true reports the would-be move without touching anything, no confirm needed."""
+    vault_write("move-me-3.md", "temp content")
+    result = json.loads(vault_move("move-me-3.md", "moved-3.md", dry_run=True))
+    assert "error" not in result
+    assert result["dry_run"] is True
+    assert result["would_move"] == {"source": "move-me-3.md", "destination": "moved-3.md"}
+    assert (vault_dir / "move-me-3.md").exists()  # untouched
+    assert not (vault_dir / "moved-3.md").exists()
+
+
+def test_vault_move_dry_run_reports_missing_source(vault_dir):
+    """dry_run surfaces a missing source as an error rather than pretending it would work."""
+    result = json.loads(vault_move("does-not-exist.md", "moved-4.md", dry_run=True))
+    assert "error" in result
+
+
+def test_vault_move_dry_run_reports_existing_destination(vault_dir):
+    """dry_run surfaces an already-occupied destination as an error."""
+    vault_write("move-me-5.md", "temp content")
+    vault_write("already-there.md", "other content")
+    result = json.loads(vault_move("move-me-5.md", "already-there.md", dry_run=True))
+    assert "error" in result
