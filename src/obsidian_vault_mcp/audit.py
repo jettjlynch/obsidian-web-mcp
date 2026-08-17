@@ -21,6 +21,8 @@ import json
 import logging
 import time
 
+from . import rate_limit
+
 logger = logging.getLogger("obsidian_vault_mcp.audit")
 
 # Argument names worth recording: what was touched, and gate/mode flags that
@@ -57,12 +59,20 @@ def _extract_error(result) -> str | None:
     return parsed.get("error") if isinstance(parsed, dict) else None
 
 
-def audited(tool_name: str):
+def audited(tool_name: str, kind: str | None = None):
     """Decorator: log every call to a vault tool with args, outcome, and duration.
 
     Applied under @mcp.tool so it wraps the plain function (functools.wraps
     keeps __wrapped__ pointing at the original, so FastMCP's signature
     introspection for the tool schema still sees the real parameters).
+
+    `kind` is "read" or "write" (matching each tool's readOnlyHint annotation
+    in server.py) or None to skip rate limiting entirely (used for tools that
+    are neither, if any are ever added). When set, enforces
+    RATE_LIMIT_READ/RATE_LIMIT_WRITE (see rate_limit.py) before calling
+    through -- a rejected call short-circuits fn entirely and is logged the
+    same as any other error result, not raised, so it reaches the caller as
+    a normal tool-error JSON body rather than an MCP-level exception.
     """
     def decorator(fn):
         @functools.wraps(fn)
@@ -71,6 +81,19 @@ def audited(tool_name: str):
             bound.update(kwargs)
             entry = {"tool": tool_name, "args": _identifying_args(bound)}
             start = time.monotonic()
+
+            if kind is not None:
+                try:
+                    rate_limit.check(kind)
+                except rate_limit.RateLimitExceeded as e:
+                    result = json.dumps({"error": str(e)})
+                    entry["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
+                    entry["ok"] = False
+                    entry["error"] = str(e)
+                    entry["rate_limited"] = True
+                    logger.info(json.dumps(entry))
+                    return result
+
             try:
                 result = fn(*args, **kwargs)
             except Exception as e:
