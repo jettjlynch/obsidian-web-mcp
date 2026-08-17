@@ -109,6 +109,7 @@ def vault_tags(tag: str | None = None) -> str:
                     post = frontmatter.loads(text)
                     tags = extract_tags(post.metadata, post.content)
                 except Exception:
+                    logger.warning("Failed to parse frontmatter for tags: %s", p)
                     continue
                 if any(t.lower() == want for t in tags):
                     notes.append(str(p.relative_to(config.effective_vault_path())))
@@ -124,6 +125,7 @@ def vault_tags(tag: str | None = None) -> str:
                 post = frontmatter.loads(text)
                 tags = extract_tags(post.metadata, post.content)
             except Exception:
+                logger.warning("Failed to parse frontmatter for tags: %s", p)
                 continue
             for t in tags:
                 counts[t] = counts.get(t, 0) + 1

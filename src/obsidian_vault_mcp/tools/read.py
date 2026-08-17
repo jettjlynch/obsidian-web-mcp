@@ -5,6 +5,7 @@ import logging
 
 import frontmatter
 
+from .. import config
 from ..markdown import find_heading_section
 from ..vault import resolve_vault_path, read_file
 
@@ -75,6 +76,11 @@ def vault_read(path: str) -> str:
 
 def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     """Read multiple files from the vault in one call."""
+    # Defense-in-depth: the pydantic model already caps this list length,
+    # but clamp here too rather than relying solely on the model layer.
+    truncated = len(paths) > config.MAX_BATCH_SIZE
+    paths = paths[: config.MAX_BATCH_SIZE]
+
     results = []
     found = 0
     missing = 0
@@ -108,4 +114,4 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             results.append({"path": path, "error": str(e)})
             missing += 1
 
-    return json.dumps({"files": results, "found": found, "missing": missing})
+    return json.dumps({"files": results, "found": found, "missing": missing, "truncated": truncated})

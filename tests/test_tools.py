@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from obsidian_vault_mcp import config
 from obsidian_vault_mcp.tools.read import vault_read, vault_batch_read
 from obsidian_vault_mcp.tools.write import vault_write, vault_append, vault_batch_frontmatter_update
 from obsidian_vault_mcp.tools.search import vault_search
@@ -136,3 +137,36 @@ def test_vault_move_dry_run_reports_existing_destination(vault_dir):
     vault_write("already-there.md", "other content")
     result = json.loads(vault_move("move-me-5.md", "already-there.md", dry_run=True))
     assert "error" in result
+
+
+# ---------- audit backlog #7: defense-in-depth limit enforcement ----------
+# The pydantic models already cap these, but these tools are called directly
+# too (see server.py), so the tool layer clamps independently rather than
+# relying solely on the model layer -- matches list_directory's existing
+# depth clamp in vault.py.
+
+def test_vault_batch_read_clamps_to_max_batch_size(vault_dir, monkeypatch):
+    monkeypatch.setattr(config, "MAX_BATCH_SIZE", 2)
+    for i in range(5):
+        vault_write(f"batch-{i}.md", "x")
+    result = json.loads(vault_batch_read([f"batch-{i}.md" for i in range(5)]))
+    assert result["truncated"] is True
+    assert result["found"] + result["missing"] == 2
+
+
+def test_vault_batch_frontmatter_update_clamps_to_max_batch_size(vault_dir, monkeypatch):
+    monkeypatch.setattr(config, "MAX_BATCH_SIZE", 2)
+    for i in range(5):
+        vault_write(f"fm-{i}.md", "---\nstatus: draft\n---\nbody")
+    updates = [{"path": f"fm-{i}.md", "fields": {"status": "done"}} for i in range(5)]
+    result = json.loads(vault_batch_frontmatter_update(updates))
+    assert result["truncated"] is True
+    assert len(result["results"]) == 2
+
+
+def test_vault_search_clamps_to_max_search_results(vault_dir, monkeypatch):
+    monkeypatch.setattr(config, "MAX_SEARCH_RESULTS", 2)
+    for i in range(5):
+        vault_write(f"search-{i}.md", "findme content")
+    result = json.loads(vault_search("findme", max_results=5))
+    assert len(result["results"]) <= 2

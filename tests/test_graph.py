@@ -72,6 +72,24 @@ def test_vault_tags_filter(vault_dir):
     assert r["total"] == 2
 
 
+def test_vault_tags_logs_malformed_frontmatter(vault_dir, caplog):
+    """Audit backlog #4: a note with unparseable frontmatter is skipped, but
+    now logs a warning instead of vanishing silently (matches
+    frontmatter_index.py's existing behavior for the identical failure)."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="obsidian_vault_mcp.tools.graph")
+    (vault_dir / "broken.md").write_text("---\ntags: [unclosed\n---\nbody #project\n")
+    (vault_dir / "t1.md").write_text("---\ntags: [project]\n---\nx\n")
+
+    r = json.loads(vault_tags("#project"))
+    assert r["notes"] == ["t1.md"]  # broken.md silently excluded from results...
+    assert any("broken.md" in rec.message for rec in caplog.records)  # ...but logged
+
+    r_all = json.loads(vault_tags())  # also exercised via the all-tags path
+    counts = {entry["tag"]: entry["count"] for entry in r_all["tags"]}
+    assert counts["project"] == 1
+
+
 # ---------- vault_daily ----------
 
 def test_vault_daily_creates_when_missing(vault_dir):

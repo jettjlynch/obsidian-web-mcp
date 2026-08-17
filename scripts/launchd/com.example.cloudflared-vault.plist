@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.example.cloudflared-vault</string>
+    <string>REPLACE_WITH_CLOUDFLARED_LABEL</string>
     <key>ProgramArguments</key>
     <array>
         <string>REPLACE_WITH_CLOUDFLARED_PATH</string>

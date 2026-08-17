@@ -10,6 +10,7 @@ import logging
 
 import frontmatter
 
+from .. import config
 from ..markdown import unified_diff
 from ..vault import resolve_vault_path, read_file, write_file_atomic
 
@@ -117,6 +118,11 @@ def vault_append(
 
 def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -> str:
     """Update frontmatter fields on multiple files without changing body content."""
+    # Defense-in-depth: the pydantic model already caps this list length,
+    # but clamp here too rather than relying solely on the model layer.
+    truncated = len(updates) > config.MAX_BATCH_SIZE
+    updates = updates[: config.MAX_BATCH_SIZE]
+
     results = []
 
     for update in updates:
@@ -149,4 +155,4 @@ def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -
         except Exception as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
 
-    return json.dumps({"results": results, "dry_run": dry_run})
+    return json.dumps({"results": results, "dry_run": dry_run, "truncated": truncated})

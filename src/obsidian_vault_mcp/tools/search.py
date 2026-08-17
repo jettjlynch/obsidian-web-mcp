@@ -147,6 +147,12 @@ def vault_search(
 ) -> str:
     """Search for text across vault files."""
     try:
+        # Defense-in-depth: the pydantic model already caps max_results, but
+        # this function is also called directly (see server.py's readOnlyHint
+        # annotations vs a hypothetical second caller) -- clamp here too,
+        # same pattern as list_directory's depth clamp in vault.py.
+        max_results = min(max_results, config.MAX_SEARCH_RESULTS)
+
         if path_prefix:
             search_path = resolve_vault_path(path_prefix)
         else:
@@ -189,6 +195,8 @@ def vault_search_frontmatter(
     from ..server import frontmatter_index
 
     try:
+        max_results = min(max_results, config.MAX_SEARCH_RESULTS)
+
         results = frontmatter_index.search_by_field(
             field=field,
             value=value,

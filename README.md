@@ -164,6 +164,13 @@ Open each plist and replace the placeholder tokens:
 - `REPLACE_WITH_OAUTH_SECRET` -- your `VAULT_OAUTH_CLIENT_SECRET` value
 - `REPLACE_WITH_HOME` -- your home directory (e.g. `/Users/yourname`)
 - `REPLACE_WITH_CLOUDFLARED_PATH` -- path to `cloudflared` binary (run `which cloudflared`)
+- `REPLACE_WITH_LABEL` (in `com.example.vault-mcp.plist`) -- a unique reverse-DNS
+  LaunchAgent label, e.g. `com.yourname.vault-mcp`. **If you use `mcp_watchdog.sh`,
+  this must exactly match its `SERVICE_LABEL` variable** -- the watchdog calls
+  `launchctl kickstart` against that label, and a mismatch means it silently
+  targets a job that was never bootstrapped.
+- `REPLACE_WITH_CLOUDFLARED_LABEL` (in `com.example.cloudflared-vault.plist`) --
+  a unique reverse-DNS label for the tunnel agent, e.g. `com.yourname.cloudflared-vault`
 
 ### 2. Load the services
 
