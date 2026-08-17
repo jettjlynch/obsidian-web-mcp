@@ -4,17 +4,26 @@ Claude's MCP connector uses the full OAuth authorization code flow:
 1. Discovers metadata at /.well-known/oauth-authorization-server
 2. Dynamically registers at /oauth/register (or uses pre-configured credentials)
 3. Redirects user's browser to /oauth/authorize
-4. Server auto-approves (single-user) and redirects back with an auth code
+4. Server shows a PIN-entry consent page; on a correct PIN it issues an auth code
+   and redirects back
 5. Claude exchanges the code at /oauth/token for a bearer token
 6. Claude uses the bearer token on all MCP requests
 
-Since this is a single-user personal server, the authorization page auto-approves
-immediately -- no login screen, no consent page. The security boundary is the
-client credentials + PKCE + the bearer token on every MCP request.
+/oauth/authorize used to auto-approve immediately (no login, no consent page) --
+fine only while the server's hostname was secret. Once it moved behind a public
+Cloudflare Tunnel hostname (Certificate-Transparency-logged, i.e. discoverable),
+that meant anyone who found the hostname could complete register -> authorize ->
+token and obtain the real bearer token in two unauthenticated requests -- PKCE
+alone doesn't stop this since an attacker controls both ends of it. Fixed
+2026-08-17 (see VAULT_OAUTH_AUTHORIZE_PIN in config.py): /oauth/authorize now
+requires a PIN, entered once per client, before a code is ever issued. Everything
+downstream (PKCE, redirect_uri matching, the bearer token on MCP requests) was
+already sound and is unchanged.
 """
 
 import hashlib
 import hmac
+import html as _html
 import logging
 import secrets
 import time
@@ -55,19 +64,75 @@ async def oauth_metadata(request: Request) -> JSONResponse:
     })
 
 
+def _consent_form_html(params: dict, error: str | None = None) -> str:
+    """Minimal PIN-entry consent page. Renders fine inside claude.ai's browser
+    redirect and jarvis-app's ASWebAuthenticationSession alike -- both are real
+    interactive browser contexts, this is a normal OAuth consent screen.
+
+    All param values are attacker-influenceable (they come straight off the
+    incoming request) and get echoed back as hidden fields, so they're
+    HTML-escaped before embedding.
+    """
+    hidden = "\n".join(
+        f'<input type="hidden" name="{_html.escape(k)}" value="{_html.escape(v or "")}">'
+        for k, v in params.items()
+    )
+    error_html = f'<p style="color:#c00">{_html.escape(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Authorize Vault Access</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 380px;
+        margin: 4rem auto; padding: 0 1rem; }}
+input[type=password] {{ width: 100%; padding: 0.6rem; font-size: 1rem; box-sizing: border-box;
+                         margin-top: 0.75rem; }}
+button {{ width: 100%; margin-top: 1rem; padding: 0.7rem; font-size: 1rem; }}
+</style></head>
+<body>
+<h2>Authorize vault access</h2>
+<p>A client is requesting access to your Obsidian vault. Enter your PIN to approve.</p>
+{error_html}
+<form method="POST">
+{hidden}
+<input type="password" name="pin" placeholder="PIN" autofocus required autocomplete="off">
+<button type="submit">Approve</button>
+</form>
+</body></html>"""
+
+
 async def oauth_authorize(request: Request):
     """OAuth 2.0 authorization endpoint.
 
-    Claude redirects the user's browser here. Since this is a single-user
-    personal server, we auto-approve: generate an auth code and redirect
-    back to Claude immediately.
+    GET renders a PIN-entry consent form carrying the original OAuth params as
+    hidden fields. POST verifies the PIN and, only then, issues an auth code and
+    redirects back to the client -- see module docstring for why this gate exists.
     """
-    response_type = request.query_params.get("response_type", "")
-    client_id = request.query_params.get("client_id", "")
-    redirect_uri = request.query_params.get("redirect_uri", "")
-    state = request.query_params.get("state", "")
-    code_challenge = request.query_params.get("code_challenge", "")
-    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+    params = {
+        "response_type": request.query_params.get("response_type", ""),
+        "client_id": request.query_params.get("client_id", ""),
+        "redirect_uri": request.query_params.get("redirect_uri", ""),
+        "state": request.query_params.get("state", ""),
+        "code_challenge": request.query_params.get("code_challenge", ""),
+        "code_challenge_method": request.query_params.get("code_challenge_method", "S256"),
+    }
+
+    if request.method == "GET":
+        return HTMLResponse(_consent_form_html(params))
+
+    # POST: params travel back as hidden fields (the browser doesn't resend
+    # the original query string on form submission).
+    form = await request.form()
+    for key in params:
+        params[key] = form.get(key, params[key])
+    pin = form.get("pin", "")
+
+    if not config.VAULT_OAUTH_AUTHORIZE_PIN or not hmac.compare_digest(pin, config.VAULT_OAUTH_AUTHORIZE_PIN):
+        logger.warning("OAuth authorize: incorrect or missing PIN -- code NOT issued")
+        return HTMLResponse(_consent_form_html(params, error="Incorrect PIN."), status_code=401)
+
+    response_type = params["response_type"]
+    redirect_uri = params["redirect_uri"]
+    state = params["state"]
 
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
@@ -79,23 +144,23 @@ async def oauth_authorize(request: Request):
     _cleanup_codes()
     code = secrets.token_urlsafe(32)
     _auth_codes[code] = {
-        "client_id": client_id,
+        "client_id": params["client_id"],
         "redirect_uri": redirect_uri,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
+        "code_challenge": params["code_challenge"],
+        "code_challenge_method": params["code_challenge_method"],
         "expires_at": time.time() + 300,  # 5 minute expiry
     }
 
-    logger.info(f"OAuth authorization code issued, redirecting to {redirect_uri[:50]}...")
+    logger.info(f"OAuth authorization code issued (PIN verified), redirecting to {redirect_uri[:50]}...")
 
     # Redirect back to Claude with the code
-    params = {"code": code}
+    out = {"code": code}
     if state:
-        params["state"] = state
+        out["state"] = state
 
     separator = "&" if "?" in redirect_uri else "?"
     return RedirectResponse(
-        url=f"{redirect_uri}{separator}{urlencode(params)}",
+        url=f"{redirect_uri}{separator}{urlencode(out)}",
         status_code=302,
     )
 
@@ -181,6 +246,25 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
     })
 
 
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    """RFC 9728 OAuth 2.0 Protected Resource Metadata.
+
+    MCP clients (claude.ai) fetch this before/alongside the authorization-server
+    metadata to confirm which auth server protects this resource. Must be
+    publicly reachable (see auth.py's _AUTH_EXEMPT_PATHS) -- previously missing
+    entirely, which 401'd via the bearer-auth middleware instead of ever
+    reaching a real route. Root-caused 2026-07-14 after a Cloudflare Tunnel
+    hostname migration surfaced it as a hard connector failure ("no MCP server
+    was found at the provided URL").
+    """
+    base_url = str(request.base_url).rstrip("/")
+    suffix = request.url.path[len("/.well-known/oauth-protected-resource"):]
+    return JSONResponse({
+        "resource": base_url + suffix,
+        "authorization_servers": [base_url],
+    })
+
+
 async def oauth_register(request: Request) -> JSONResponse:
     """Dynamic client registration endpoint.
 
@@ -209,7 +293,9 @@ async def oauth_register(request: Request) -> JSONResponse:
 # Starlette routes to mount on the app
 oauth_routes = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
-    Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource, methods=["GET"]),
+    Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
     Route("/oauth/token", oauth_token, methods=["POST"]),
     Route("/oauth/register", oauth_register, methods=["POST"]),
 ]

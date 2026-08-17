@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
+from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_OAUTH_AUTHORIZE_PIN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
 from .frontmatter_index import FrontmatterIndex
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,9 @@ mcp = FastMCP(
             "127.0.0.1:*",
             "localhost:*",
             "[::1]:*",
-            # Mac Mini ngrok reserved domain (added 2026-05-22):
-            "gigabyte-widget-elevating.ngrok-free.dev",
-            "gigabyte-widget-elevating.ngrok-free.dev:*",
+            # Cloudflare Tunnel hostname (added 2026-07-14, replaces ngrok):
+            "vault-mcp.wzdmai.com",
+            "vault-mcp.wzdmai.com:*",
         ],
     ),
 )
@@ -371,6 +371,13 @@ def main():
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
+    if not VAULT_OAUTH_AUTHORIZE_PIN:
+        logger.warning(
+            "VAULT_OAUTH_AUTHORIZE_PIN is not set -- /oauth/authorize will reject "
+            "every request (fail closed), so no NEW client can complete OAuth "
+            "sign-in until it's set. Already-issued bearer tokens still work."
+        )
+
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
         from .auth import BearerAuthMiddleware
@@ -386,9 +393,16 @@ def main():
         logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
 
         import uvicorn
+        # 127.0.0.1, NOT 0.0.0.0: the only legitimate non-local caller is the
+        # Cloudflare Tunnel, and cloudflared runs on this machine and dials
+        # localhost:8420 (see ~/.cloudflared/config-vault-mcp.yml). A wildcard
+        # bind exposed the port to the whole LAN — which on this network
+        # (shared-building ISP, customer.ask4.lan) means strangers' devices.
+        # allowed_hosts does NOT protect against that (it only checks the Host
+        # header, which any direct caller can forge). Changed 2026-07-14.
         uvicorn.run(
             app,
-            host="0.0.0.0",
+            host="127.0.0.1",
             port=VAULT_MCP_PORT,
             log_level="info",
             proxy_headers=True,

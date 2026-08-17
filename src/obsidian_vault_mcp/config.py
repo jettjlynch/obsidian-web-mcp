@@ -35,6 +35,15 @@ def effective_vault_path() -> "Path":
 VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 
+# PIN required to approve a new OAuth client at /oauth/authorize. Added
+# 2026-08-17 after auditing prouds-mcp's SECURITY.md: without this, /oauth/authorize
+# auto-approved ANY caller (no login, no consent page), so anyone who knew this
+# server's hostname could complete register -> authorize -> token and obtain the
+# real VAULT_MCP_TOKEN in two unauthenticated requests -- PKCE alone doesn't stop
+# this since an attacker controls both ends of it. Unset = authorize always
+# rejects (fail closed), not fail open.
+VAULT_OAUTH_AUTHORIZE_PIN = os.environ.get("VAULT_OAUTH_AUTHORIZE_PIN", "")
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation
