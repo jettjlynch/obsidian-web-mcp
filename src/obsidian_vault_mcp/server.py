@@ -378,40 +378,47 @@ def main():
             "sign-in until it's set. Already-issued bearer tokens still work."
         )
 
-    # Build the Starlette app with auth middleware and OAuth endpoints
-    try:
-        from .auth import BearerAuthMiddleware
-        from .oauth import oauth_routes
+    # Build the Starlette app with auth middleware and OAuth endpoints.
+    #
+    # Deliberately NO try/except-with-unauthenticated-fallback here. This used
+    # to catch any Exception building the app and fall back to bare
+    # mcp.run(transport="streamable-http", ...) with only a logger.warning --
+    # meaning any transient error (a bad import, anything) would silently
+    # republish the whole vault to the internet (this server sits behind a
+    # public, discoverable Cloudflare Tunnel hostname) with zero auth, and the
+    # watchdog wouldn't catch it either since it only checks for a 200
+    # response, not whether auth is actually enforced. Fixed 2026-08-17 as a
+    # live-risk finding from the vault-mcp security audit: if this fails now,
+    # the process exits and launchd's KeepAlive restarts it -- crash-looping
+    # loudly beats silently serving unauthenticated.
+    from .auth import BearerAuthMiddleware
+    from .oauth import oauth_routes
 
-        app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app()
 
-        # Mount OAuth routes (these are excluded from bearer auth via the middleware)
-        for route in oauth_routes:
-            app.routes.insert(0, route)
+    # Mount OAuth routes (these are excluded from bearer auth via the middleware)
+    for route in oauth_routes:
+        app.routes.insert(0, route)
 
-        app.add_middleware(BearerAuthMiddleware)
-        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
+    app.add_middleware(BearerAuthMiddleware)
+    logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
 
-        import uvicorn
-        # 127.0.0.1, NOT 0.0.0.0: the only legitimate non-local caller is the
-        # Cloudflare Tunnel, and cloudflared runs on this machine and dials
-        # localhost:8420 (see ~/.cloudflared/config-vault-mcp.yml). A wildcard
-        # bind exposed the port to the whole LAN — which on this network
-        # (shared-building ISP, customer.ask4.lan) means strangers' devices.
-        # allowed_hosts does NOT protect against that (it only checks the Host
-        # header, which any direct caller can forge). Changed 2026-07-14.
-        uvicorn.run(
-            app,
-            host="127.0.0.1",
-            port=VAULT_MCP_PORT,
-            log_level="info",
-            proxy_headers=True,
-            forwarded_allow_ips="*",
-        )
-    except Exception as e:
-        logger.warning(f"Could not build app ({e}), falling back to mcp.run()")
-        logger.warning("Auth will NOT be enforced in this mode")
-        mcp.run(transport="streamable-http", port=VAULT_MCP_PORT)
+    import uvicorn
+    # 127.0.0.1, NOT 0.0.0.0: the only legitimate non-local caller is the
+    # Cloudflare Tunnel, and cloudflared runs on this machine and dials
+    # localhost:8420 (see ~/.cloudflared/config-vault-mcp.yml). A wildcard
+    # bind exposed the port to the whole LAN — which on this network
+    # (shared-building ISP, customer.ask4.lan) means strangers' devices.
+    # allowed_hosts does NOT protect against that (it only checks the Host
+    # header, which any direct caller can forge). Changed 2026-07-14.
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=VAULT_MCP_PORT,
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
 
 
 if __name__ == "__main__":
