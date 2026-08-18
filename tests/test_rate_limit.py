@@ -5,7 +5,7 @@ import json
 import pytest
 
 from obsidian_vault_mcp import config, rate_limit
-from obsidian_vault_mcp.audit import audited
+from obsidian_vault_mcp.rate_limit import rate_limited
 
 
 @pytest.fixture(autouse=True)
@@ -50,14 +50,14 @@ def test_zero_limit_disables_enforcement():
         rate_limit.check("read")  # never raises
 
 
-def test_audited_short_circuits_and_logs_without_calling_fn(caplog):
+def test_rate_limited_short_circuits_and_logs_without_calling_fn(caplog):
     import logging
-    caplog.set_level(logging.INFO, logger="obsidian_vault_mcp.audit")
+    caplog.set_level(logging.WARNING, logger="obsidian_vault_mcp.rate_limit")
     config.RATE_LIMIT_READ = 1
 
     calls = []
 
-    @audited("fake_read_tool", kind="read")
+    @rate_limited(kind="read")
     def fake_tool(path: str) -> str:
         calls.append(path)
         return json.dumps({"ok": True})
@@ -69,16 +69,18 @@ def test_audited_short_circuits_and_logs_without_calling_fn(caplog):
     assert "error" in result
     assert calls == ["a.md"]  # second call never reached fn
 
-    entries = [json.loads(r.message) for r in caplog.records]
-    assert entries[-1]["ok"] is False
-    assert entries[-1]["rate_limited"] is True
+    assert any("Rate limit rejected" in r.message for r in caplog.records)
 
 
-def test_audited_without_kind_is_never_rate_limited():
+def test_rate_limited_tool_not_wrapped_is_never_rate_limited():
+    """A tool with no @rate_limited decorator at all is simply never checked --
+    the old `audited(..., kind=None)` escape hatch had no other purpose than this
+    once rate limiting and audit logging split into separate decorators/call sites
+    (2026-08-18 upstream merge); a tool that wants no rate limiting just omits the
+    decorator rather than applying it with a null kind."""
     config.RATE_LIMIT_READ = 1
     config.RATE_LIMIT_WRITE = 1
 
-    @audited("fake_tool")  # no kind
     def fake_tool() -> str:
         return json.dumps({"ok": True})
 

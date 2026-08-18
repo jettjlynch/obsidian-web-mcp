@@ -2,12 +2,13 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import (
     CONTEXT_LINES,
     DEFAULT_SEARCH_RESULTS,
     MAX_BATCH_SIZE,
+    MAX_BINARY_SIZE,
     MAX_CONTENT_SIZE,
     MAX_LIST_DEPTH,
     MAX_SEARCH_RESULTS,
@@ -57,8 +58,8 @@ class VaultWriteInput(BaseModel):
     )
 
 
-class VaultAppendInput(BaseModel):
-    """Append content to the end of a file in the vault."""
+class VaultWriteBinaryInput(BaseModel):
+    """Write an allowed binary file to the vault from base64-encoded content."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -68,18 +69,109 @@ class VaultAppendInput(BaseModel):
         min_length=1,
         max_length=500,
     )
-    content: str = Field(
+    data: str = Field(
         ...,
-        description="Content to append to the end of the file",
-        max_length=MAX_CONTENT_SIZE,
+        description="Base64-encoded file content",
+        # base64 expands ~4/3; cap the encoded length so an oversized payload is rejected
+        # before it is decoded into memory.
+        max_length=((MAX_BINARY_SIZE + 2) // 3) * 4 + 1024,
+    )
+    media_type: str = Field(
+        ...,
+        description="MIME type of the binary content; must be in the server's allowlist",
+        min_length=3,
+        max_length=200,
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Overwrite an existing file at the target path",
     )
     create_dirs: bool = Field(
         default=True,
-        description="Create the file (and parent directories) if it doesn't exist",
+        description="Create parent directories if they don't exist",
     )
-    ensure_newline: bool = Field(
+
+
+class VaultEditOperationInput(BaseModel):
+    """Replace one exact text fragment inside a vault file."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_str_replace_aliases(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
+            if canonical in normalized and alias in normalized:
+                raise ValueError(f"Use either '{canonical}' or '{alias}', not both")
+            if alias in normalized:
+                normalized[canonical] = normalized.pop(alias)
+
+        return normalized
+
+    old_text: str = Field(
+        ...,
+        description="Exact existing text fragment to replace; must appear exactly once",
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    new_text: str = Field(
+        ...,
+        description="Replacement text for old_text",
+        max_length=MAX_CONTENT_SIZE,
+    )
+
+
+class VaultEditInput(BaseModel):
+    """Patch an existing file with exact text replacements."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    edits: list[VaultEditOperationInput] = Field(
+        ...,
+        description="Ordered exact text replacements to apply without resending the full file",
+        min_length=1,
+        max_length=MAX_BATCH_SIZE,
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Preview the patch and diff without writing the file",
+    )
+
+
+class VaultAppendInput(BaseModel):
+    """Append content to a file without resending the existing body."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    content: str = Field(
+        ...,
+        description="Content to append or write if the file does not exist",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    separator: str = Field(
+        default="\n\n",
+        description="Text inserted between existing content and appended content",
+        max_length=100,
+    )
+    create_dirs: bool = Field(
         default=True,
-        description="If true, ensure a newline separates existing content from the appended content",
+        description="Create parent directories if they don't exist",
     )
     dry_run: bool = Field(
         default=False,
@@ -403,19 +495,161 @@ class VaultTagsInput(BaseModel):
     )
 
 
-class VaultDailyInput(BaseModel):
-    """Resolve, create, append to, or read today's daily note."""
+# ----------------------------------------------------------------------------
+# Canvas, daily-note, and analytics tools (upstream, merged 2026-08-18)
+# ----------------------------------------------------------------------------
 
-    model_config = ConfigDict(extra="forbid")
 
-    content: str | None = Field(
-        default=None,
-        description="Content to append to today's daily note. Omit to just read it.",
-        max_length=MAX_CONTENT_SIZE,
-    )
-    heading: str | None = Field(
-        default=None,
-        description="If appending, the heading to append under (created if absent). Else appends at end.",
+def _validate_alnum_id(value: str | None) -> str | None:
+    if value is not None and not value.isalnum():
+        raise ValueError("id must be alphanumeric when provided")
+    return value
+
+
+class CanvasNodeInput(BaseModel):
+    """A single Obsidian Canvas node.
+
+    extra='allow' preserves Obsidian-specific fields (text, file, color, label,
+    subpath, ...) so appending a node never strips data on the round-trip.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = Field(default=None, description="Optional alphanumeric node id; generated when omitted")
+    type: str = Field(..., min_length=1, description="Canvas node type, e.g. text, file, link, or group")
+    x: int | float = Field(..., description="Canvas x coordinate")
+    y: int | float = Field(..., description="Canvas y coordinate")
+    width: int | float = Field(..., gt=0, description="Node width")
+    height: int | float = Field(..., gt=0, description="Node height")
+
+    @field_validator("id")
+    @classmethod
+    def _node_id_alnum(cls, v: str | None) -> str | None:
+        return _validate_alnum_id(v)
+
+
+class CanvasEdgeInput(BaseModel):
+    """A single Obsidian Canvas edge. extra='allow' preserves color/label/etc."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = Field(default=None, description="Optional alphanumeric edge id; generated when omitted")
+    fromNode: str = Field(..., min_length=1, description="Existing source node id")
+    fromSide: Literal["top", "right", "bottom", "left"] = Field(..., description="One of: top, right, bottom, left")
+    toNode: str = Field(..., min_length=1, description="Existing target node id")
+    toSide: Literal["top", "right", "bottom", "left"] = Field(..., description="One of: top, right, bottom, left")
+
+    @field_validator("id")
+    @classmethod
+    def _edge_id_alnum(cls, v: str | None) -> str | None:
+        return _validate_alnum_id(v)
+
+
+class VaultCanvasReadInput(BaseModel):
+    """Read and parse an Obsidian .canvas file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path to a .canvas file from the vault root",
+        min_length=1,
         max_length=500,
     )
-    dry_run: bool = _DRY_RUN
+
+
+class VaultCanvasAddNodeInput(BaseModel):
+    """Append a node to a .canvas file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path to a .canvas file (created if missing)",
+        min_length=1,
+        max_length=500,
+    )
+    node: CanvasNodeInput = Field(..., description="Node to append")
+
+
+class VaultCanvasAddEdgeInput(BaseModel):
+    """Append an edge to an existing .canvas file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path to an existing .canvas file",
+        min_length=1,
+        max_length=500,
+    )
+    edge: CanvasEdgeInput = Field(..., description="Edge to append; fromNode/toNode must already exist")
+
+
+class VaultDailyNoteAppendInput(BaseModel):
+    """Append content to today's daily note."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    content: str = Field(
+        ...,
+        description="Content to append to today's daily note (the note is created from the template if missing)",
+        max_length=MAX_CONTENT_SIZE,
+    )
+
+
+class VaultAnalyticsSummaryInput(BaseModel):
+    """Build a compact analytics summary for a vault path."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path_prefix: str | None = Field(
+        default=None,
+        description="Optional folder prefix to restrict the analysis",
+        max_length=500,
+    )
+    required_frontmatter: list[str] | None = Field(
+        default=None,
+        description="Optional required frontmatter fields to validate",
+        max_length=20,
+    )
+    max_examples: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum example findings to include per category",
+    )
+
+
+class VaultAnalyticsFindingsInput(BaseModel):
+    """Return detailed findings for one analytics category."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    category: Literal[
+        "frontmatter_missing",
+        "required_frontmatter_missing",
+        "broken_wikilinks",
+        "suspicious_tag_variants",
+        "encoding_issues",
+        "oversized_files",
+    ] = Field(
+        ...,
+        description="Analytics finding category to return",
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Optional folder prefix to restrict the analysis",
+        max_length=500,
+    )
+    required_frontmatter: list[str] | None = Field(
+        default=None,
+        description="Optional required frontmatter fields to validate",
+        max_length=20,
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of findings to return",
+    )

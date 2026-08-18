@@ -1,20 +1,38 @@
 """Write tools for the Obsidian vault MCP server.
 
-Every write tool supports ``dry_run=True``: it computes the would-be content,
-returns a unified diff, and writes nothing. This is a hard safety requirement
-given the vault's history of accidental full-file overwrites.
+vault_write, vault_append, and vault_batch_frontmatter_update all support
+``dry_run=True``: it computes the would-be content, returns a unified diff, and
+writes nothing. This is a hard safety requirement given the vault's history of
+accidental full-file overwrites; vault_edit had its own dry_run from the start
+(see below).
 """
 
-import json
+import base64
+import binascii
+import difflib
 import logging
+from pathlib import Path
 
 import frontmatter
 
-from .. import config
-from ..markdown import unified_diff
-from ..vault import resolve_vault_path, read_file, write_file_atomic
+from .. import config, frontmatter_io
+from ..frontmatter_io import YAMLError
+from ..serialization import dumps
+from ..vault import resolve_vault_path, read_file, write_bytes_atomic, write_file_atomic
+from ..write_events import fire_write
 
 logger = logging.getLogger(__name__)
+
+
+def _unified_diff(path: str, before: str, after: str) -> str:
+    """Return a compact unified diff for an edit preview or result."""
+    return "".join(difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"{path} before",
+        tofile=f"{path} after",
+        lineterm="",
+    ))
 
 
 def vault_write(
@@ -38,82 +56,300 @@ def vault_write(
         final_content = content
         if merge_frontmatter and existed:
             try:
-                existing_post = frontmatter.loads(old_content)
-                new_post = frontmatter.loads(content)
+                existing_meta, _ = frontmatter_io.loads(old_content)
+                new_meta, new_body = frontmatter_io.loads(content)
 
-                merged_meta = dict(existing_post.metadata)
-                merged_meta.update(new_post.metadata)
+                # Mutate existing in place: untouched keys keep their original
+                # formatting (quote style, comments, key order); new keys are
+                # appended. ruamel round-trip avoids PyYAML's normalisation.
+                for key, value in new_meta.items():
+                    existing_meta[key] = value
 
-                new_post.metadata = merged_meta
-                final_content = frontmatter.dumps(new_post)
-            except Exception as e:
-                logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
+                final_content = frontmatter_io.dumps(existing_meta, new_body)
+            except FileNotFoundError:
+                pass
+            except YAMLError as e:
+                # Malformed YAML in either side: abort rather than silently
+                # dropping the existing frontmatter or nesting a stray --- block.
+                # A correctable error beats a lossy write for an agent caller.
+                return dumps({
+                    "error": f"Frontmatter merge aborted: malformed YAML frontmatter ({e})",
+                    "path": path,
+                    "created": False,
+                })
 
         if dry_run:
-            return json.dumps({
+            return dumps({
                 "path": path,
                 "dry_run": True,
                 "would_change": final_content != old_content,
                 "would_create": not existed,
-                "diff": unified_diff(path, old_content, final_content),
+                "diff": _unified_diff(path, old_content, final_content),
             })
 
         is_new, size = write_file_atomic(path, final_content, create_dirs=create_dirs)
 
-        return json.dumps({"path": path, "created": is_new, "size": size})
+        fire_write("created" if is_new else "updated", [path])
+        return dumps({"path": path, "created": is_new, "size": size})
     except ValueError as e:
-        return json.dumps({"error": str(e), "path": path})
+        return dumps({"error": str(e), "path": path})
     except Exception as e:
         logger.error(f"vault_write error for {path}: {e}")
-        return json.dumps({"error": str(e), "path": path})
+        return dumps({"error": str(e), "path": path})
+
+
+# Binary writes are restricted to an allowlist of media types, each mapped to the file
+# extensions permitted for it. The map is deliberately conservative and lists only inert
+# formats; the allowlist is the security boundary that keeps this from being an
+# arbitrary-file-write. SVG is intentionally excluded: it can carry <script>/onload, and
+# because validation is by declared media_type + extension (never by sniffing bytes),
+# allowing it would be an arbitrary-active-content write into a vault that may be synced or
+# rendered in a preview surface.
+DEFAULT_ALLOWED_BINARY_MEDIA_TYPES = {
+    "image/png": {".png"},
+    "image/jpeg": {".jpg", ".jpeg"},
+    "image/webp": {".webp"},
+    "image/gif": {".gif"},
+    "application/pdf": {".pdf"},
+}
+
+
+def _validate_binary_target(path: str, media_type: str) -> Path:
+    """Resolve a binary target path and enforce the media-type / extension allowlist."""
+    resolved = resolve_vault_path(path)
+    allowed_extensions = DEFAULT_ALLOWED_BINARY_MEDIA_TYPES.get(media_type.strip().lower())
+    if not allowed_extensions:
+        raise ValueError(f"Unsupported media_type: {media_type}")
+    extension = Path(path).suffix.lower()
+    if extension not in allowed_extensions:
+        raise ValueError(f"Extension '{extension}' is not allowed for media_type '{media_type}'")
+    return resolved
+
+
+def _decode_base64(data: str) -> bytes:
+    """Decode a strict base64 payload."""
+    try:
+        return base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid base64 data") from exc
+
+
+def vault_write_binary(
+    path: str,
+    data: str,
+    media_type: str,
+    overwrite: bool = False,
+    create_dirs: bool = True,
+) -> str:
+    """Write an allowed binary file (image/PDF) to the vault from base64-encoded content.
+
+    The allowlist gates on the declared ``media_type`` and the file extension, not on the
+    bytes -- a caller can write arbitrary bytes under an allowed extension. That is
+    acceptable for a single-user vault (you only fool yourself), but the type is a
+    convention, not a guarantee. PDF in particular can carry active content; it is included
+    because it is a core attachment format, not because it is inert.
+    """
+    try:
+        resolved = _validate_binary_target(path, media_type)
+
+        try:
+            decoded = _decode_base64(data)
+        except ValueError as exc:
+            return dumps({"error": str(exc), "path": path, "media_type": media_type})
+
+        if resolved.exists() and not overwrite:
+            return dumps({
+                "error": f"File already exists: {path}. Set overwrite=true to replace it.",
+                "path": path,
+                "media_type": media_type,
+            })
+
+        is_new, size = write_bytes_atomic(path, decoded, create_dirs=create_dirs, overwrite=overwrite)
+        return dumps({"path": path, "created": is_new, "size": size, "media_type": media_type})
+    except ValueError as e:
+        return dumps({"error": str(e), "path": path, "media_type": media_type})
+    except Exception as e:
+        logger.error(f"vault_write_binary error for {path}: {e}")
+        return dumps({"error": str(e), "path": path, "media_type": media_type})
+
+
+def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
+    normalized = dict(edit)
+    for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
+        if canonical in normalized and alias in normalized:
+            return None, f"Use either '{canonical}' or '{alias}', not both"
+        if alias in normalized:
+            normalized[canonical] = normalized.pop(alias)
+
+    return normalized, None
+
+
+def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
+    """Apply exact text replacements to an existing file without resending the full body."""
+    try:
+        content, _ = read_file(path)
+        original_content = content
+
+        for index, edit in enumerate(edits):
+            normalized_edit, alias_error = _normalize_edit_aliases(edit)
+            if alias_error:
+                return dumps({
+                    "error": f"Edit {index}: {alias_error}",
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
+            old_text = normalized_edit.get("old_text", "")
+            new_text = normalized_edit.get("new_text", "")
+            count = content.count(old_text)
+
+            if count != 1:
+                return dumps({
+                    "error": (
+                        f"Edit {index} old_text must match exactly once; "
+                        f"found {count} matches"
+                    ),
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
+            content = content.replace(old_text, new_text, 1)
+
+        diff = _unified_diff(path, original_content, content)
+        size = len(content.encode("utf-8"))
+
+        if dry_run:
+            return dumps({
+                "path": path,
+                "changed": False,
+                "dry_run": True,
+                "diff": diff,
+                "edits_applied": len(edits),
+                "size": size,
+            })
+
+        changed = content != original_content
+        if changed:
+            write_file_atomic(path, content, create_dirs=False)
+            fire_write("updated", [path])
+
+        return dumps({
+            "path": path,
+            "changed": changed,
+            "dry_run": False,
+            "diff": diff,
+            "edits_applied": len(edits),
+            "size": size,
+        })
+    except ValueError as e:
+        return dumps({
+            "error": str(e),
+            "path": path,
+            "changed": False,
+            "dry_run": dry_run,
+            "diff": "",
+            "edits_applied": 0,
+            "size": 0,
+        })
+    except FileNotFoundError:
+        return dumps({
+            "error": f"File not found: {path}",
+            "path": path,
+            "changed": False,
+            "dry_run": dry_run,
+            "diff": "",
+            "edits_applied": 0,
+            "size": 0,
+        })
+    except Exception as e:
+        logger.error(f"vault_edit error for {path}: {e}")
+        return dumps({
+            "error": str(e),
+            "path": path,
+            "changed": False,
+            "dry_run": dry_run,
+            "diff": "",
+            "edits_applied": 0,
+            "size": 0,
+        })
 
 
 def vault_append(
     path: str,
     content: str,
+    separator: str = "\n\n",
     create_dirs: bool = True,
-    ensure_newline: bool = True,
     dry_run: bool = False,
 ) -> str:
-    """Append content to the end of a file, creating it if it doesn't exist."""
+    """Append content to a file without requiring the caller to send the full body."""
     try:
         resolve_vault_path(path)
 
+        created = False
         try:
             existing_content, _ = read_file(path)
-            is_new = False
         except FileNotFoundError:
             existing_content = ""
-            is_new = True
+            created = True
 
-        base = existing_content
-        if base and ensure_newline and not base.endswith("\n"):
-            base += "\n"
+        if created or not existing_content:
+            new_content = content
+        elif content:
+            new_content = f"{existing_content}{separator}{content}"
+        else:
+            new_content = existing_content
 
-        new_content = base + content
+        changed = new_content != existing_content
 
         if dry_run:
-            return json.dumps({
+            return dumps({
                 "path": path,
                 "dry_run": True,
-                "would_change": new_content != existing_content,
-                "would_create": is_new,
-                "diff": unified_diff(path, existing_content, new_content),
+                "would_change": changed,
+                "would_create": created,
+                "diff": _unified_diff(path, existing_content, new_content),
             })
 
-        _, size = write_file_atomic(path, new_content, create_dirs=create_dirs)
+        if changed:
+            _, size = write_file_atomic(path, new_content, create_dirs=create_dirs)
+            fire_write("created" if created else "updated", [path])
+        else:
+            size = len(existing_content.encode("utf-8"))
 
-        return json.dumps({
+        return dumps({
             "path": path,
-            "created": is_new,
+            "changed": changed,
+            "created": created,
+            "appended": not created and changed,
             "size": size,
-            "appended_bytes": len(content.encode("utf-8")),
         })
     except ValueError as e:
-        return json.dumps({"error": str(e), "path": path})
+        return dumps({
+            "error": str(e),
+            "path": path,
+            "changed": False,
+            "created": False,
+            "appended": False,
+            "size": 0,
+        })
     except Exception as e:
         logger.error(f"vault_append error for {path}: {e}")
-        return json.dumps({"error": str(e), "path": path})
+        return dumps({
+            "error": str(e),
+            "path": path,
+            "changed": False,
+            "created": False,
+            "appended": False,
+            "size": 0,
+        })
 
 
 def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -> str:
@@ -143,7 +379,7 @@ def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -
                     "path": file_path,
                     "dry_run": True,
                     "would_change": new_content != content,
-                    "diff": unified_diff(file_path, content, new_content),
+                    "diff": _unified_diff(file_path, content, new_content),
                 })
             else:
                 write_file_atomic(file_path, new_content, create_dirs=False)
@@ -155,4 +391,10 @@ def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -
         except Exception as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
 
-    return json.dumps({"results": results, "dry_run": dry_run, "truncated": truncated})
+    if not dry_run:
+        # One event per batch, carrying only the paths actually written.
+        written = [r["path"] for r in results if r.get("updated")]
+        if written:
+            fire_write("updated", written)
+
+    return dumps({"results": results, "dry_run": dry_run, "truncated": truncated})

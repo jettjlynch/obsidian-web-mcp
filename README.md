@@ -37,15 +37,19 @@ Obsidian and the MCP server both operate on the same directory of markdown files
 
 This is a server that provides network access to your personal notes. Security is not optional.
 
-**Authentication is enforced on every request.** The server implements OAuth 2.0 authorization code flow with PKCE for initial client authentication (what Claude uses when you connect the integration), plus bearer token validation on every subsequent MCP tool call. No request reaches a tool function without a valid token.
+**A human logs in before any client is authorized.** Connecting a client uses the OAuth 2.0 authorization-code + PKCE flow, which opens a browser at `/oauth/authorize`. There, you must sign in with `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD` before the server issues an authorization code -- the password is required on every authorization. Every subsequent MCP tool call is then validated against a bearer token. No authorization code is issued to an unauthenticated visitor, and no request reaches a tool function without a valid token. **If `VAULT_OAUTH_PASSWORD` is not set, the server fails closed and refuses to authorize anyone** -- there is no anonymous auto-approve.
 
-**Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports. You can layer Cloudflare Access on top for additional authentication (SSO, device posture checks, IP restrictions) if you want defense in depth.
+**Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports, and the server itself binds to loopback (`127.0.0.1`) by default. The login above is the authentication boundary; you can additionally layer Cloudflare Access (SSO, device posture, IP restrictions) on top for defense in depth.
 
 **Path traversal is blocked at the filesystem layer.** Every file operation resolves paths against the vault root directory and rejects any attempt to escape it -- `..` traversal, symlink following, null byte injection, and dotfile access (`.obsidian`, `.git`, `.trash`) are all caught before they reach the filesystem. The server will never read or write outside your vault directory.
 
 **Writes are atomic.** Every file write goes to a temporary file first, then atomically replaces the target via `os.replace()`. This guarantees that neither Obsidian nor Obsidian Sync ever sees a partially-written file -- the operation either completes fully or doesn't happen at all.
 
 **Safety limits prevent abuse.** Writes are capped at 1MB per file, batch operations at 20 files per request, and search results at 50 matches. Deletions are soft -- files move to `.trash/` rather than being permanently removed, matching Obsidian's own behavior. The delete tool also requires an explicit `confirm=true` parameter as a safety gate.
+
+## Reporting Security Issues
+
+Found a vulnerability? Please report it privately rather than opening a public issue or pull request. This repository has [private vulnerability reporting](https://github.com/jimprosser/obsidian-web-mcp/security/advisories) enabled: open the repo's **Security** tab and click **Report a vulnerability**. I'll acknowledge the report, coordinate a fix, and credit you in the resulting advisory. Please hold public disclosure until a patch is available.
 
 ## Tools
 
@@ -54,12 +58,23 @@ This is a server that provides network access to your personal notes. Security i
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
 | `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
+| `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews |
+| `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
 | `vault_search` | Full-text search across vault files (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault |
 | `vault_delete` | Soft-delete a file by moving it to `.trash/` (requires explicit confirmation) |
+| `vault_canvas_read` | Read an Obsidian `.canvas` file and return its parsed nodes and edges |
+| `vault_canvas_add_node` | Append a node to a `.canvas` file (created if missing); generates an id when omitted and preserves unknown node fields |
+| `vault_canvas_add_edge` | Append an edge to an existing `.canvas` file; both endpoints must reference existing node ids |
+| `vault_daily_note_path` | Resolve today's daily-note path from the configured folder/format |
+| `vault_daily_note_read` | Read today's daily note; returns an error (does not create it) when missing |
+| `vault_daily_note_append` | Append to today's daily note, creating it from the template when missing |
+| `vault_analytics_summary` | Compact vault-hygiene summary: counts and examples of missing frontmatter, broken wikilinks, near-duplicate tag variants, and non-UTF-8 files |
+| `vault_analytics_findings` | Detailed findings for one analytics category (`frontmatter_missing`, `required_frontmatter_missing`, `broken_wikilinks`, `suspicious_tag_variants`, `encoding_issues`, `oversized_files`) |
 
 ## Prerequisites
 
@@ -75,12 +90,16 @@ This is a server that provides network access to your personal notes. Security i
 
 ```bash
 # Clone and enter the project
-git clone https://github.com/yourname/obsidian-web-mcp.git
+git clone https://github.com/jimprosser/obsidian-web-mcp.git
 cd obsidian-web-mcp
 
-# Generate auth tokens
+# Generate the MCP bearer token
 export VAULT_MCP_TOKEN=$(python -c "import secrets; print(secrets.token_hex(32))")
-export VAULT_OAUTH_CLIENT_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+
+# Set the login the OAuth browser step requires. REQUIRED -- without a password
+# the server fails closed and refuses to authorize any client.
+export VAULT_OAUTH_USERNAME="you"
+export VAULT_OAUTH_PASSWORD="$(python -c "import secrets; print(secrets.token_urlsafe(24))")"   # or a passphrase you'll remember
 
 # Point at your vault
 export VAULT_PATH="$HOME/Obsidian/MyVault"
@@ -89,7 +108,7 @@ export VAULT_PATH="$HOME/Obsidian/MyVault"
 uv run vault-mcp
 ```
 
-The server starts on port 8420 by default. It serves MCP over Streamable HTTP at `/mcp/`.
+The server starts on port 8420 by default and serves MCP over Streamable HTTP at `/` (the root path — MCP clients connect to the base URL directly). It binds to `127.0.0.1` -- reachable locally and through a Cloudflare Tunnel, but not exposed on your LAN. Set `VAULT_MCP_HOST=0.0.0.0` only if you deliberately want direct network exposure.
 
 ## Configuration
 
@@ -98,12 +117,58 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token for authenticating MCP requests |
+| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
+| `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
+| `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
+| `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
-| `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | OAuth 2.0 client ID for Claude integration |
-| `VAULT_OAUTH_CLIENT_SECRET` | Yes | (none) | OAuth 2.0 client secret for Claude integration |
+| `VAULT_MCP_PATH` | No | `/` | HTTP path the MCP transport mounts at. Default `/` keeps connector interop (#19) byte-identical. Set to a prefix like `/mcp` to host the server alongside other services on one hostname behind a reverse proxy that can't rewrite paths. **Validated at startup:** must be absolute and must not collide with an auth-exempt route (`/health`, `/oauth/*`, `/.well-known/*`), or the server refuses to start (fail-closed) rather than serve the vault on an unauthenticated path. |
+| `VAULT_MCP_ALLOWED_HOSTS` | No | (none) | Comma-separated hostnames allowed through the MCP library's DNS-rebinding protection, **appended** to the loopback defaults (`127.0.0.1`, `localhost`, `[::1]`). Set this to your tunnel/proxy hostname (e.g. `vault-mcp.yourdomain.com`) for any remote deployment, otherwise requests carrying that `Host` are rejected. |
+| `VAULT_MCP_FORWARDED_ALLOW_IPS` | No | `127.0.0.1` | Client IPs uvicorn trusts to set `X-Forwarded-*` headers. Loopback-only by default, because a trusted Cloudflare Tunnel / Caddy proxy connects over localhost. **Never set this to `*`** -- that lets any caller spoof the advertised OAuth origin via `X-Forwarded-Host`. Set to `::1` if your proxy connects over IPv6 loopback. |
+| `VAULT_MCP_PUBLIC_URL` | No | (none) | Canonical public origin (e.g. `https://vault-mcp.yourdomain.com`) for every URL the server advertises -- the OAuth discovery metadata and the `WWW-Authenticate` challenge. When set it **pins** those URLs so a spoofed `Host` / `X-Forwarded-Host` header cannot redirect OAuth discovery to an attacker. When unset, the per-request base URL is used. Recommended for any reverse-proxy deployment. |
+| `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
+| `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
+| `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
+| `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
+| `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
+| `VAULT_MCP_HEARTBEAT_URL` | No | (none) | Optional push URL for an uptime monitor (Uptime Kuma, Healthchecks.io, ...). When set, a daemon thread GETs it on an interval. Must be `http(s)`; redirects are not followed and the URL is treated as a secret (never logged in full). Empty = disabled. |
+| `VAULT_MCP_HEARTBEAT_INTERVAL` | No | `60` | Seconds between heartbeat pings. Must be a positive integer; a bad value fails closed at startup. Only used when `VAULT_MCP_HEARTBEAT_URL` is set. |
+| `VAULT_AUDIT_LOG_PATH` | No | (none) | Append-only JSONL audit log of vault mutations. When set, every mutation appends one record; empty disables auditing. The raw bearer token is never written -- only its SHA-256 hash. Must resolve **outside** the vault and be writable; otherwise the server **fails closed** at startup. See [Audit logging](#audit-logging). |
+| `VAULT_AUDIT_LOG_INCLUDE_READS` | No | `false` | Also record read/search operations (`1`/`true`/`yes`/`on`). Off by default; mutations are always logged once the audit log is enabled. |
 
-Generate tokens with: `python -c "import secrets; print(secrets.token_hex(32))"`
+Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+## Audit logging
+
+Set `VAULT_AUDIT_LOG_PATH` to a file path to record every vault mutation as an append-only
+JSON line. Auditing is **off by default**; with no path set there is no overhead. Reads and
+searches are logged too when `VAULT_AUDIT_LOG_INCLUDE_READS` is on (off by default, since
+reads are high-volume).
+
+Each record carries: `timestamp` (UTC), `token_id_hash` (SHA-256 of the bearer token -- the
+raw token is never written), `client_id` (a best-effort User-Agent hint), `operation`,
+`target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256),
+`request_id`, `operation_status`, and `error`. Example line:
+
+```json
+{"checksum_after":"9f86d0…","checksum_before":null,"client_id":"claude","error":null,"operation":"vault_write","operation_status":"success","request_id":"a1b2…","size_after":42,"size_before":null,"target_path":"notes/today.md","timestamp":"2026-06-14T18:30:00+00:00","token_id_hash":"5e88…"}
+```
+
+**Put the log outside the vault.** `VAULT_AUDIT_LOG_PATH` must resolve outside `VAULT_PATH`.
+A log inside the vault would be just another file the vault tools can reach, so an
+authenticated caller could overwrite it (`vault_write`) or move it (`vault_delete`) and
+defeat the append-only premise. The server validates this at startup and **refuses to start
+(fail-closed)** if the path is not writable or resolves inside the vault.
+
+**Threat model — the log is best-effort at runtime, not tamper-evident.** A write failure
+at runtime is logged to the server log but never alters the tool result (the audit trail
+must not be able to break a write), so a record can be dropped silently; the server log is
+the only signal. Batch mutations emit one record per file with that file's own status, so a
+partial failure is never recorded as a whole-batch success. The unauthenticated `GET /health`
+endpoint reports only `{"status": "ok", "audit": {"enabled": <bool>}}` — it deliberately does
+not expose the log path or write counters (which would leak host filesystem layout and a
+vault-activity side-channel to anonymous callers over the tunnel).
 
 ## Connecting to Claude
 
@@ -112,9 +177,9 @@ The Claude desktop and mobile apps can connect to remote MCP servers via OAuth.
 1. Start the server (locally or behind a tunnel)
 2. Open Claude and go to **Settings > Integrations > Add Integration**
 3. Enter your server URL (e.g. `https://vault-mcp.yourdomain.com`)
-4. Enter the OAuth client ID and client secret you configured
-5. Claude will discover the OAuth endpoints automatically and open a browser window
-6. The server auto-approves the authorization (single-user model) and redirects back
+4. Claude registers automatically (dynamic client registration) and discovers the OAuth endpoints
+5. Claude opens a browser window at the server's `/oauth/authorize`
+6. **Sign in** with your `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD`; the server then issues the authorization and redirects back
 7. Claude now has access to all nine vault tools -- on desktop and mobile
 
 For local-only use (no tunnel), point Claude at `http://localhost:8420`.
@@ -134,15 +199,10 @@ export VAULT_MCP_HOSTNAME="vault-mcp.yourdomain.com"
 
 The script authenticates with Cloudflare, creates a tunnel, writes the config, and sets up the DNS record. You will need a domain managed by Cloudflare.
 
-After setup, add your tunnel hostname to the `allowed_hosts` list in `server.py` so the MCP library's DNS rebinding protection accepts requests from your domain:
+After setup, allow your tunnel hostname through the MCP library's DNS rebinding protection by setting `VAULT_MCP_ALLOWED_HOSTS` (comma-separated; appended to the loopback defaults, so no source edit is needed):
 
-```python
-allowed_hosts=[
-    "127.0.0.1:*",
-    "localhost:*",
-    "[::1]:*",
-    "vault-mcp.yourdomain.com",  # add your hostname here
-],
+```bash
+export VAULT_MCP_ALLOWED_HOSTS="vault-mcp.yourdomain.com"
 ```
 
 ## Production Deployment (macOS)
@@ -161,7 +221,8 @@ Open each plist and replace the placeholder tokens:
 - `REPLACE_WITH_PROJECT_PATH` -- absolute path to this project directory
 - `REPLACE_WITH_VAULT_PATH` -- absolute path to your Obsidian vault
 - `REPLACE_WITH_TOKEN` -- your `VAULT_MCP_TOKEN` value
-- `REPLACE_WITH_OAUTH_SECRET` -- your `VAULT_OAUTH_CLIENT_SECRET` value
+- `REPLACE_WITH_OAUTH_USERNAME` -- the login username you want (e.g. your name)
+- `REPLACE_WITH_OAUTH_PASSWORD` -- your `VAULT_OAUTH_PASSWORD` value (required; the server refuses to authorize without it)
 - `REPLACE_WITH_HOME` -- your home directory (e.g. `/Users/yourname`)
 - `REPLACE_WITH_CLOUDFLARED_PATH` -- path to `cloudflared` binary (run `which cloudflared`)
 - `REPLACE_WITH_LABEL` (in `com.example.vault-mcp.plist`) -- a unique reverse-DNS
@@ -171,6 +232,15 @@ Open each plist and replace the placeholder tokens:
   targets a job that was never bootstrapped.
 - `REPLACE_WITH_CLOUDFLARED_LABEL` (in `com.example.cloudflared-vault.plist`) --
   a unique reverse-DNS label for the tunnel agent, e.g. `com.yourname.cloudflared-vault`
+
+**Remote deployments (tunnel or VPS):** a launchd service does not inherit shell `export`s, so the `VAULT_MCP_ALLOWED_HOSTS` you set in the Tunnel section above must be added directly to the plist's `EnvironmentVariables` dict — otherwise DNS-rebinding protection rejects your public hostname. Add your hostname (and, recommended, pin the advertised origin):
+
+```xml
+<key>VAULT_MCP_ALLOWED_HOSTS</key>
+<string>vault-mcp.yourdomain.com</string>
+<key>VAULT_MCP_PUBLIC_URL</key>
+<string>https://vault-mcp.yourdomain.com</string>
+```
 
 ### 2. Load the services
 
@@ -207,10 +277,10 @@ The server coexists with Obsidian Sync (or any file-based sync mechanism) withou
 ### Running tests
 
 ```bash
-uv run pytest tests/ -v
+uv run --extra dev pytest tests/ -v
 ```
 
-Tests use temporary directories and never touch your real vault.
+(`pytest` lives in the optional `dev` extra, so the `--extra dev` flag is what installs and runs it.) Tests use temporary directories and never touch your real vault.
 
 ### Project structure
 
@@ -218,9 +288,11 @@ Tests use temporary directories and never touch your real vault.
 src/obsidian_vault_mcp/
     auth.py                 # Bearer token middleware (Starlette)
     config.py               # Environment variable configuration
+    extensions.py           # Extension seam: base class for adding tools/routes/hooks
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
     oauth.py                # OAuth 2.0 authorization code flow with PKCE
+    serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)
     tools/
@@ -230,13 +302,199 @@ src/obsidian_vault_mcp/
         write.py            # write, batch_frontmatter_update tools
 tests/
     conftest.py             # Shared fixtures (temp vault with sample files)
+    test_auth.py            # Bearer middleware + WWW-Authenticate challenge tests
+    test_config.py          # Environment-variable parsing tests
     test_frontmatter.py     # Frontmatter index and query tests
+    test_issues_5_28.py     # Regression tests for date serialization + index rebuild
+    test_oauth.py           # OAuth flow, PKCE, and auth-bypass regression tests
     test_tools.py           # Integration tests for tool functions
     test_vault.py           # Path resolution and file operation tests
 scripts/
     setup-tunnel.sh         # Interactive Cloudflare Tunnel setup
     launchd/                # macOS launchd plist templates
 ```
+
+### Extending the server
+
+You can add your own tools, HTTP routes, and index hooks **without forking `server.py`**.
+Subclass `extensions.Extension` (every hook is a no-op by default, so override only what
+you need) and run the server with `serve([YourExtension()])` from your own entry point:
+
+```python
+from obsidian_vault_mcp.server import serve
+from obsidian_vault_mcp.extensions import Extension
+from obsidian_vault_mcp.write_events import register_write_listener
+
+
+class MyExtension(Extension):
+    def register_tools(self, mcp):
+        # add @mcp.tool tools BEFORE the app/tool schema is built
+        ...
+
+    def before_indexes_start(self, frontmatter_index):
+        # e.g. attach a change listener so no change is missed once the index starts
+        frontmatter_index.add_change_listener(self._on_change)
+        # ...or react to a mutation as an operation (see write-event seam below)
+        register_write_listener(self._on_write)  # _on_write(operation, paths)
+
+    def after_indexes_start(self, frontmatter_index):
+        # e.g. start a periodic reconcile loop now that the index is live
+        ...
+
+    def register_routes(self, app):
+        # add Starlette routes (bearer-protected like the rest of the surface)
+        ...
+
+    def shutdown(self):
+        # released at process exit (registered via atexit)
+        ...
+
+
+def main():
+    serve([MyExtension()])
+```
+
+The hooks run in the order above.
+
+> **Trust model — read this.** Extensions are **fully-trusted, in-process code** that you
+> choose to load. An extension runs with the server's full privileges: it can read the
+> bearer token and OAuth secrets, read/write your vault, and mutate any route. This is
+> **not a sandbox** — only load extensions you wrote or trust, like any dependency.
+
+Two things worth knowing:
+
+- **Extension routes are authenticated, with a footgun guard.** Routes are registered
+  before the bearer-auth middleware, so they require the bearer token like every other
+  route. As a guardrail against honest mistakes, `build_app()` **fails closed** if an
+  extension adds a route that would cover an auth-exempt path (`/health`, `/oauth/*`,
+  `/.well-known/*`, or the off-root `GET/HEAD /` probe) — including via a wildcard
+  pattern — and rejects extension `Mount`s and `WebSocketRoute`s outright. This catches
+  accidents; it is **not** a boundary against a hostile extension (which, running
+  in-process, could bypass it anyway — see the trust model above).
+- **The stock server is unaffected.** With no extensions, `serve()` behaves exactly like
+  the previous `main()`; `FrontmatterIndex` change listeners and write listeners are a no-op
+  with none registered.
+- **Write listeners see mutations as operations.** Where `add_change_listener` is watcher-driven
+  (`(abs_path, exists)`, `.md` only, can't tell a tool write from an external edit),
+  `write_events.register_write_listener(cb)` fires `cb(operation, paths)` once per successful
+  mutation from the core write tools — `operation` is `"created"`/`"updated"`/`"moved"`/`"deleted"`,
+  a move passes `[source, destination]`, a batch passes only the paths it wrote. The publish
+  side, `fire_write(operation, paths)`, is public so an extension that writes on its own path
+  can join the same stream. Use it for a provenance-aware commit, an audit log, or a webhook;
+  a listener's exception is logged and swallowed.
+
+## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
+
+This is an alternative to the Cloudflare Tunnel flow above. In this setup, the MCP server runs on a VPS, Cloudflare proxies a public hostname such as `your-mcp-server.dev`, Caddy terminates TLS with a Cloudflare Origin Certificate, and Caddy reverse-proxies requests to the local MCP server on `VAULT_MCP_PORT`. No Cloudflare Tunnel is required.
+
+These steps assume Ubuntu 24.04 on the VPS. Expose only ports `80` and `443` publicly. Do not open `VAULT_MCP_PORT` to the internet.
+
+### 1. Prepare the VPS
+
+- Point `your-mcp-server.dev` at your VPS in Cloudflare DNS
+- Turn on the Cloudflare proxy for that record (orange cloud)
+- In the Cloudflare dashboard, set **SSL/TLS** mode to **Full (Strict)**
+
+### 2. Install Caddy
+
+```bash
+sudo apt update
+sudo apt install -y debian-keyring debian-archive-keyring curl
+
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+  sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+  sudo tee /etc/apt/sources.list.d/caddy-stable.list
+
+sudo apt update
+sudo apt install -y caddy
+caddy version
+```
+
+### 3. Create and install a Cloudflare Origin Certificate
+
+Generate the certificate in the Cloudflare dashboard under **SSL/TLS > Origin Server > Create Certificate**.
+
+```bash
+sudo mkdir -p /etc/your-mcp-server/tls
+sudo cp cert.pem key.pem /etc/your-mcp-server/tls/
+sudo chmod 750 /etc/your-mcp-server/tls
+sudo chmod 640 /etc/your-mcp-server/tls/cert.pem
+sudo chmod 600 /etc/your-mcp-server/tls/key.pem
+```
+
+### 4. Configure Caddy
+
+Edit `/etc/caddy/Caddyfile`:
+
+```caddyfile
+your-mcp-server.dev {
+    tls /etc/your-mcp-server/tls/cert.pem /etc/your-mcp-server/tls/key.pem
+    reverse_proxy localhost:8420
+}
+
+:80 {
+    redir https://{host}{uri}
+}
+```
+
+If you use a different local port, replace `8420` with the value you set for `VAULT_MCP_PORT`.
+
+Apply the config and verify Caddy is healthy:
+
+```bash
+sudo systemctl restart caddy
+sudo systemctl status caddy --no-pager
+```
+
+Live logs:
+
+```bash
+journalctl -u caddy -f
+```
+
+### 5. Allow the public hostname in the server
+
+The MCP library enables DNS rebinding protection, so set `VAULT_MCP_ALLOWED_HOSTS` to your public hostname (comma-separated; appended to the loopback defaults — no need to edit the source):
+
+```bash
+export VAULT_MCP_ALLOWED_HOSTS="your-mcp-server.dev"
+```
+
+Caddy reverse-proxies from `localhost`, so the loopback-only `VAULT_MCP_FORWARDED_ALLOW_IPS` default already trusts its `X-Forwarded-*` headers — no change needed. As defense in depth, pin the origin the server advertises in OAuth discovery so a spoofed `X-Forwarded-Host` can never redirect it:
+
+```bash
+export VAULT_MCP_PUBLIC_URL="https://your-mcp-server.dev"
+```
+
+### 6. Start obsidian-web-mcp on the VPS
+
+Use the same environment variables described in [Configuration](#configuration), then start the server on the local port Caddy proxies to:
+
+```bash
+export VAULT_MCP_PORT=8420
+uv run vault-mcp
+```
+
+If you run the service under `systemd`, keep `VAULT_MCP_PORT` aligned with the `reverse_proxy` target in the Caddyfile.
+
+### 7. Verify the deployment
+
+From the VPS, confirm the local server is responding:
+
+```bash
+curl -s http://localhost:8420/.well-known/oauth-authorization-server
+```
+
+Then confirm the public HTTPS endpoint works through Cloudflare and Caddy:
+
+```bash
+curl -I https://your-mcp-server.dev
+curl -s https://your-mcp-server.dev/.well-known/oauth-authorization-server
+```
+
+When you add the integration in Claude, use `https://your-mcp-server.dev` as the server URL.
 
 ## License
 

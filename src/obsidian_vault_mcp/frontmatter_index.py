@@ -23,30 +23,64 @@ class FrontmatterIndex:
         self._observer: Observer | None = None
         self._debounce_timer: threading.Timer | None = None
         self._pending_paths: set[str] = set()
+        self._change_listeners: list = []
+
+    def add_change_listener(self, callback) -> None:
+        """Register a callback(abs_path: str, exists: bool) invoked on .md file changes.
+
+        Called after each debounced change is applied to the index, so an extension
+        (e.g. a semantic/embedding index) can mirror the same change. Listeners run
+        with no listeners registered by default -- a true no-op on the stock server.
+        Exceptions raised by a listener are logged and swallowed, never propagated.
+        """
+        self._change_listeners.append(callback)
 
     def start(self) -> None:
-        """Walk all .md files, parse frontmatter, and start watching for changes."""
+        """Build the index from disk, then start watching for changes.
+
+        Idempotent: a second call while already running is a no-op. The index is
+        built once at process start (server.main), never per request -- see #28.
+        """
+        if self._observer is not None:
+            return
         t0 = time.monotonic()
-        count = 0
-
-        for md_path in config.effective_vault_path().rglob("*.md"):
-            if self._is_excluded(md_path):
-                continue
-            rel = str(md_path.relative_to(config.effective_vault_path()))
-            fm = self._parse_frontmatter(md_path)
-            if fm is not None:
-                self._index[rel] = fm
-                count += 1
-
+        self.rebuild()
         elapsed = time.monotonic() - t0
         logger.info(
-            "Frontmatter index built: %d files in %.2f seconds", count, elapsed
+            "Frontmatter index built: %d files in %.2f seconds", self.file_count, elapsed
         )
 
         self._observer = Observer()
         handler = _VaultEventHandler(self)
         self._observer.schedule(handler, str(config.effective_vault_path()), recursive=True)
         self._observer.start()
+
+    def rebuild(self) -> None:
+        """Rebuild the whole index from disk and swap it in atomically.
+
+        Built into a fresh dict off-lock, then swapped under the lock so a concurrent
+        search never observes a half-built index. Exposed so a periodic reconcile
+        floor can call it directly -- a dead watcher then degrades to bounded
+        staleness instead of unbounded drift. Note: rebuild() does not serialize
+        with in-flight watcher flushes; a concurrent flush may be overwritten by the
+        swap, which is acceptable as bounded staleness (the next flush/rebuild heals).
+        """
+        # config.effective_vault_path(), not VAULT_PATH: under VAULT_SCOPE_ROOT this
+        # keeps every indexed key scope-relative, matching resolve_vault_path() and
+        # the watcher scheduled on the same root in start() -- indexing against the
+        # unscoped VAULT_PATH here would silently index files outside the scope and
+        # produce paths one folder too deep for every lookup against this index.
+        root = config.effective_vault_path()
+        new_index: dict[str, dict] = {}
+        for md_path in root.rglob("*.md"):
+            if self._is_excluded(md_path):
+                continue
+            rel = str(md_path.relative_to(root))
+            fm = self._parse_frontmatter(md_path)
+            if fm is not None:
+                new_index[rel] = fm
+        with self._lock:
+            self._index = new_index
 
     def stop(self) -> None:
         """Stop the filesystem observer and cancel any pending debounce."""
@@ -133,7 +167,8 @@ class FrontmatterIndex:
         for abs_path_str in paths:
             abs_path = Path(abs_path_str)
             rel = str(abs_path.relative_to(config.effective_vault_path()))
-            if abs_path.exists():
+            exists = abs_path.exists()
+            if exists:
                 fm = self._parse_frontmatter(abs_path)
                 with self._lock:
                     if fm is not None:
@@ -143,6 +178,13 @@ class FrontmatterIndex:
             else:
                 with self._lock:
                     self._index.pop(rel, None)
+            # Notify change listeners (e.g. an extension's embedding index) outside
+            # the lock. A listener failure must not stall indexing for other paths.
+            for listener in self._change_listeners:
+                try:
+                    listener(abs_path_str, exists)
+                except Exception:
+                    logger.warning("Change listener error for %s", abs_path_str)
 
 
 class _VaultEventHandler(FileSystemEventHandler):
@@ -170,3 +212,22 @@ class _VaultEventHandler(FileSystemEventHandler):
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         self._handle(event)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        # Atomic writes (write_file_atomic: tempfile.mkstemp + os.replace) and
+        # vault_move/vault_delete (shutil.move) surface as MOVED events, not
+        # created/modified -- without this the index never sees vault_write output.
+        # Schedule BOTH endpoints: src (now gone -> popped on flush) and dest
+        # (now present -> re-parsed + added). .tmp/.trash paths are filtered out
+        # by the .md-suffix and _is_excluded checks inside the loop.
+        if event.is_directory:
+            return
+        for raw_path in (event.src_path, getattr(event, "dest_path", None)):
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if path.suffix != ".md":
+                continue
+            if self._index._is_excluded(path):
+                continue
+            self._index._schedule_debounce(raw_path)

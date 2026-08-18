@@ -9,6 +9,7 @@ from pathlib import Path
 import frontmatter
 
 from .. import config
+from ..serialization import dumps
 from ..vault import resolve_vault_path
 
 logger = logging.getLogger(__name__)
@@ -43,8 +44,9 @@ def _search_ripgrep(
     # authenticated caller (or via adversarial vault content, if a query is
     # ever derived from it). Root-caused while comparing against
     # jimprosser/obsidian-web-mcp's independent fix for the identical bug
-    # (their commit a4cf931). `-e` forces ripgrep to treat what follows as
-    # the search pattern regardless of a leading "-", closing the injection.
+    # (their commit a4cf931, merged 2026-08-18). `-e` forces ripgrep to treat
+    # what follows as the search pattern regardless of a leading "-", closing
+    # the injection.
     cmd += ["-e", query, str(search_path)]
 
     try:
@@ -170,7 +172,7 @@ def vault_search(
             search_path = config.effective_vault_path()
 
         if not search_path.is_dir():
-            return json.dumps({"error": f"Search path is not a directory: {path_prefix}"})
+            return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
         if shutil.which("rg"):
             matches = _search_ripgrep(query, search_path, file_pattern, max_results, context_lines)
@@ -183,16 +185,16 @@ def vault_search(
 
         truncated = len(matches) >= max_results
 
-        return json.dumps({
+        return dumps({
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
         })
     except ValueError as e:
-        return json.dumps({"error": str(e)})
+        return dumps({"error": str(e)})
     except Exception as e:
         logger.error(f"vault_search error: {e}")
-        return json.dumps({"error": str(e)})
+        return dumps({"error": str(e)})
 
 
 def vault_search_frontmatter(
@@ -228,11 +230,11 @@ def vault_search_frontmatter(
 
         truncated = len(results) > max_results
 
-        return json.dumps({
+        return dumps({
             "results": formatted,
             "total": len(formatted),
             "truncated": truncated,
         })
     except Exception as e:
         logger.error(f"vault_search_frontmatter error: {e}")
-        return json.dumps({"error": str(e)})
+        return dumps({"error": str(e)})

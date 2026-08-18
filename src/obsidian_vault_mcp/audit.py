@@ -1,113 +1,240 @@
-"""Audit-trail logging for every vault tool call.
+"""Append-only JSON-lines audit log for vault mutations.
 
-Every MCP tool call passes through the wrapper functions registered in
-server.py -- the single choke point instrumented here, rather than scattering
-logging calls across every tools/*.py file individually. Added 2026-08-17 as
-backlog item #1 from the vault-mcp security audit: before this, every
-`logger.*` call in tools/*.py was error-path only, so if the bearer token or
-OAuth PIN ever leaked there would be zero record of what was actually read or
-written. This logs every call -- success and failure alike -- at INFO level
-to the same stderr stream the rest of the server already logs to, so it's
-picked up by whatever log rotation/collection exists for the launchd process.
+When VAULT_AUDIT_LOG_PATH is set, every vault mutation appends one JSON record to that
+file: a UTC timestamp, a SHA-256 hash of the bearer token (never the token itself), the
+operation, the target path, and the size + checksum of the target before and after the
+change. Read/search operations are logged too when VAULT_AUDIT_LOG_INCLUDE_READS is on.
 
-Deliberately logs only path/identifier-shaped arguments (which file, which
-tag, which query), never `content`/`find`/`replace`/`new_content` bodies --
-otherwise the audit log becomes a second, less-protected copy of the vault
-itself, which defeats the point of an audit trail.
+Auditing is off unless a log path is configured. At startup the path is validated as
+writable AND rejected if it resolves inside the vault (where the vault tools could rewrite
+it), so a misconfigured path fails the server closed. At runtime the log is best-effort:
+a failure to write a record is logged but never alters the tool result -- the audit trail
+must not be able to break a write.
 """
 
-import functools
-import json
+from __future__ import annotations
+
+import hashlib
 import logging
-import time
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-from . import rate_limit
+from . import config
+from .context import current_request_context
+from .serialization import dumps
+from .vault import resolve_vault_path
 
-logger = logging.getLogger("obsidian_vault_mcp.audit")
+logger = logging.getLogger(__name__)
 
-# Argument names worth recording: what was touched, and gate/mode flags that
-# change what an entry means. Everything else (content bodies, replacement
-# text, frontmatter values) is dropped.
-_LOGGED_KEYS = (
-    "path", "paths", "source", "destination", "target", "field", "tag",
-    "query", "path_prefix", "file_pattern", "after_heading", "after_line",
-    "heading", "confirm", "dry_run", "match_type", "occurrence", "updates",
-)
+# Operations that change the vault. Always audited when a log path is configured.
+MUTATION_OPERATIONS = {
+    "vault_write",
+    "vault_edit",
+    "vault_append",
+    "vault_batch_frontmatter_update",
+    "vault_move",
+    "vault_delete",
+    "vault_canvas_add_node",
+    "vault_canvas_add_edge",
+    "vault_daily_note_append",
+    # Local-only granular edit tools (tools/edit.py), preserved through the
+    # 2026-08-18 upstream merge -- upstream's vault_edit only covers exact-text
+    # find/replace, not heading-relative inserts/section replace/prepend.
+    "vault_find_replace",
+    "vault_insert_at",
+    "vault_replace_section",
+    "vault_append_under_heading",
+    "vault_prepend",
+}
+
+# Read/search operations. Audited only when VAULT_AUDIT_LOG_INCLUDE_READS is enabled.
+READ_OPERATIONS = {
+    "vault_read",
+    "vault_batch_read",
+    "vault_search",
+    "vault_search_frontmatter",
+    "vault_list",
+    "vault_canvas_read",
+    "vault_daily_note_read",
+    # Local-only read tools (tools/read.py, tools/graph.py), no upstream equivalent.
+    "vault_read_section",
+    "vault_links",
+    "vault_backlinks",
+    "vault_tags",
+}
+
+# Mutations whose result reports per-file outcomes; audited one record per file.
+BATCH_OPERATIONS = {"vault_batch_frontmatter_update"}
 
 
-def _identifying_args(bound: dict) -> dict:
-    """Keep only path/identifier/flag-shaped args; drop content bodies."""
-    out = {}
-    for k, v in bound.items():
-        if k not in _LOGGED_KEYS:
-            continue
-        if k == "updates" and isinstance(v, list):
-            # updates is a list of {"path": ..., "fields": {...}} -- keep the
-            # paths, drop the field values being written.
-            out[k] = [u.get("path") for u in v if isinstance(u, dict)]
-        else:
-            out[k] = v
-    return out
+def audit_enabled() -> bool:
+    """True when append-only audit logging is configured."""
+    return bool(config.VAULT_AUDIT_LOG_PATH)
 
 
-def _extract_error(result) -> str | None:
-    """Tool functions return a JSON string; pull out an "error" key if present."""
-    try:
-        parsed = json.loads(result)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    return parsed.get("error") if isinstance(parsed, dict) else None
+def read_audit_enabled() -> bool:
+    """True when read/search operations should also be audited."""
+    return audit_enabled() and bool(config.VAULT_AUDIT_LOG_INCLUDE_READS)
 
 
-def audited(tool_name: str, kind: str | None = None):
-    """Decorator: log every call to a vault tool with args, outcome, and duration.
+def should_audit_operation(operation: str) -> bool:
+    """True when this operation should emit a record under the current config.
 
-    Applied under @mcp.tool so it wraps the plain function (functools.wraps
-    keeps __wrapped__ pointing at the original, so FastMCP's signature
-    introspection for the tool schema still sees the real parameters).
-
-    `kind` is "read" or "write" (matching each tool's readOnlyHint annotation
-    in server.py) or None to skip rate limiting entirely (used for tools that
-    are neither, if any are ever added). When set, enforces
-    RATE_LIMIT_READ/RATE_LIMIT_WRITE (see rate_limit.py) before calling
-    through -- a rejected call short-circuits fn entirely and is logged the
-    same as any other error result, not raised, so it reaches the caller as
-    a normal tool-error JSON body rather than an MCP-level exception.
+    False whenever auditing is off, so the wrapper is a true passthrough (no snapshot
+    work) on the default path.
     """
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            bound = dict(zip(fn.__code__.co_varnames, args))
-            bound.update(kwargs)
-            entry = {"tool": tool_name, "args": _identifying_args(bound)}
-            start = time.monotonic()
+    if not audit_enabled():
+        return False
+    return operation in MUTATION_OPERATIONS or (
+        operation in READ_OPERATIONS and read_audit_enabled()
+    )
 
-            if kind is not None:
-                try:
-                    rate_limit.check(kind)
-                except rate_limit.RateLimitExceeded as e:
-                    result = json.dumps({"error": str(e)})
-                    entry["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
-                    entry["ok"] = False
-                    entry["error"] = str(e)
-                    entry["rate_limited"] = True
-                    logger.info(json.dumps(entry))
-                    return result
 
-            try:
-                result = fn(*args, **kwargs)
-            except Exception as e:
-                entry["ok"] = False
-                entry["error"] = str(e)
-                entry["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
-                logger.info(json.dumps(entry))
-                raise
-            entry["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
-            error = _extract_error(result)
-            entry["ok"] = error is None
-            if error is not None:
-                entry["error"] = error
-            logger.info(json.dumps(entry))
-            return result
-        return wrapper
-    return decorator
+def audit_log_path() -> Path:
+    return Path(config.VAULT_AUDIT_LOG_PATH).expanduser()
+
+
+def audit_path_writable(path: Path | None = None) -> bool:
+    """True when the audit log can be written (creating intermediate dirs if needed).
+
+    An existing log must be a writable file. Otherwise the log is creatable when the
+    nearest existing ancestor is a writable directory -- write_audit_record mkdirs the
+    intermediate dirs. A path whose parent is a regular file is rejected.
+    """
+    path = path or audit_log_path()
+    try:
+        if path.exists():
+            return path.is_file() and os.access(path, os.W_OK)
+        ancestor = path.parent
+        while not ancestor.exists():
+            if ancestor.parent == ancestor:
+                return False
+            ancestor = ancestor.parent
+        return ancestor.is_dir() and os.access(ancestor, os.W_OK)
+    except OSError:
+        return False
+
+
+def audit_path_inside_vault() -> bool:
+    """True when the configured audit log resolves inside the vault.
+
+    A same-vault log is just another file the vault tools can reach: resolve_vault_path
+    only blocks traversal and dotfiles, so an authenticated caller could overwrite it via
+    vault_write or relocate it via vault_delete, defeating the append-only integrity
+    premise. Such a path is rejected at startup (see server.main).
+    """
+    if not audit_enabled():
+        return False
+    try:
+        log = audit_log_path().resolve()
+        vault = config.VAULT_PATH.resolve()
+    except OSError:
+        return False
+    return log == vault or vault in log.parents
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _hash_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def snapshot_path(path: Any) -> dict[str, Any]:
+    """Capture (size, checksum) for a vault-relative path; nulls when absent or invalid.
+
+    Routes through resolve_vault_path so a path that escapes the vault is treated as
+    absent rather than read.
+    """
+    empty: dict[str, Any] = {"size": None, "checksum": None}
+    if not isinstance(path, str) or not path:
+        return empty
+    try:
+        resolved = resolve_vault_path(path)
+    except ValueError:
+        return empty
+    if not resolved.is_file():
+        return empty
+    return {"size": resolved.stat().st_size, "checksum": _sha256_file(resolved)}
+
+
+def before_target_path(operation: str, context: dict[str, Any]) -> Any:
+    """The path to snapshot before a mutation runs."""
+    if operation == "vault_move":
+        return context.get("source")
+    return context.get("path") or context.get("source")
+
+
+def infer_target_path(operation: str, context: dict[str, Any], result: dict[str, Any] | None = None) -> Any:
+    """Best-effort target path from the call context and the parsed result payload."""
+    result = result or {}
+    if operation == "vault_move":
+        return result.get("destination") or context.get("destination")
+    if operation == "vault_batch_frontmatter_update":
+        results = result.get("results")
+        if isinstance(results, list):
+            paths = [item.get("path") for item in results if isinstance(item, dict) and item.get("path")]
+            if paths:
+                return paths
+    return result.get("path") or context.get("path") or context.get("source")
+
+
+def build_audit_record(
+    *,
+    operation: str,
+    target_path: Any,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+    operation_status: str = "success",
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Build one normalized audit record from the current request context."""
+    ctx = current_request_context()
+    before = before or {"size": None, "checksum": None}
+    after = after or {"size": None, "checksum": None}
+    return {
+        "timestamp": _now_utc().isoformat(),
+        "token_id_hash": _hash_value(ctx.get("principal")),
+        "client_id": ctx.get("client"),
+        "operation": operation,
+        "target_path": target_path,
+        "size_before": before.get("size"),
+        "size_after": after.get("size"),
+        "checksum_before": before.get("checksum"),
+        "checksum_after": after.get("checksum"),
+        "request_id": ctx.get("request_id") or uuid.uuid4().hex,
+        "operation_status": operation_status,
+        "error": error,
+    }
+
+
+def write_audit_record(record: dict[str, Any]) -> bool:
+    """Append one JSON record. A write failure is logged and swallowed (best-effort)."""
+    if not audit_enabled():
+        return False
+    try:
+        path = audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = dumps(record, sort_keys=True) + "\n"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+        return True
+    except Exception as exc:
+        logger.error("Audit log write failed: %s", exc)
+        return False
