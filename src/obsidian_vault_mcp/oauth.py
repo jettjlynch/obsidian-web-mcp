@@ -270,6 +270,20 @@ async def oauth_register(request: Request) -> JSONResponse:
 
     Claude calls this during initial setup to register as an OAuth client.
     Returns pre-configured credentials.
+
+    Emergency fix 2026-08-18: this used to return config.VAULT_OAUTH_CLIENT_SECRET
+    -- the real, shared secret -- to ANY unauthenticated caller, since /oauth/register
+    carries no auth gate (see auth.py's _AUTH_EXEMPT_PATHS). Combined with
+    grant_type=client_credentials at /oauth/token (which only checks that secret,
+    never the /oauth/authorize PIN), that was a full bypass of the PIN gate added
+    earlier the same day: register -> token in 2 unauthenticated requests yielded the
+    real VAULT_MCP_TOKEN, the exact hole the PIN gate was meant to close. Root-caused
+    while merging in jimprosser/obsidian-web-mcp's independent fix for the same class
+    of bug (upstream commit e4924f0), which generates a per-client secret instead --
+    matched here. The client_secret returned here is unused by any code path in this
+    file (authorization_code doesn't check it; client_credentials only accepts the
+    real config.VAULT_OAUTH_CLIENT_SECRET, known only to whoever configured it
+    out-of-band) -- it exists only because the DCR response shape requires the field.
     """
     try:
         body = await request.json()
@@ -278,10 +292,12 @@ async def oauth_register(request: Request) -> JSONResponse:
 
     # Generate a unique client_id for this registration
     client_id = f"vault-mcp-{secrets.token_hex(8)}"
+    # Per-client, freshly generated -- NEVER config.VAULT_OAUTH_CLIENT_SECRET.
+    client_secret = secrets.token_hex(32)
 
     return JSONResponse({
         "client_id": client_id,
-        "client_secret": config.VAULT_OAUTH_CLIENT_SECRET,
+        "client_secret": client_secret,
         "client_name": body.get("client_name", "Obsidian Vault MCP Client"),
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
