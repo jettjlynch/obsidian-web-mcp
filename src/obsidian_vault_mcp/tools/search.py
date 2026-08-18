@@ -29,12 +29,23 @@ def _search_ripgrep(
         f"--glob={file_pattern}",
         "-i",
         f"--context={context_lines}",
-        query,
-        str(search_path),
     ]
 
     for excluded in config.EXCLUDED_DIRS:
-        cmd.insert(-2, f"--glob=!{excluded}/")
+        cmd.append(f"--glob=!{excluded}/")
+
+    # EMERGENCY FIX 2026-08-18: `query` used to be appended as a bare
+    # positional argv element. A query beginning with "-" was therefore
+    # parsed by ripgrep as an OPTION, not a search pattern -- in particular
+    # vault_search(query="--pre=/bin/sh") sets ripgrep's --pre preprocessor,
+    # which runs an arbitrary program against every searched file: remote
+    # code execution reachable from the search tool's query argument by any
+    # authenticated caller (or via adversarial vault content, if a query is
+    # ever derived from it). Root-caused while comparing against
+    # jimprosser/obsidian-web-mcp's independent fix for the identical bug
+    # (their commit a4cf931). `-e` forces ripgrep to treat what follows as
+    # the search pattern regardless of a leading "-", closing the injection.
+    cmd += ["-e", query, str(search_path)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
