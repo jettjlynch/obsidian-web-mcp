@@ -44,6 +44,39 @@ VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 # rejects (fail closed), not fail open.
 VAULT_OAUTH_AUTHORIZE_PIN = os.environ.get("VAULT_OAUTH_AUTHORIZE_PIN", "")
 
+# S1 (2026-08-30, closing the rest of C-1/M-1): the PIN gate above stops an
+# unauthenticated caller from ever reaching an approval, but it alone did NOT
+# validate redirect_uri -- a caller who supplied (or tricked Jett into
+# approving) an arbitrary redirect_uri still got the code sent there
+# (open redirect). This is the static client's exact-match allowlist,
+# consulted by oauth.py alongside the per-client redirect_uris that dynamic
+# registrants (e.g. claude.ai's MCP connector) declare via /oauth/register.
+# Comma-separated. Default is jarvis-app's real, verified value: its own
+# config.ts hardcodes clientId='jarvis-app' and calls
+# `AuthSession.makeRedirectUri({ path: 'oauth/callback' })` with no `native`
+# override, which (per expo-auth-session's makeRedirectUri -> expo-linking's
+# createURL with isTripleSlashed defaulting false) resolves to exactly
+# `jarvisapp://oauth/callback` for a standalone build using the app's
+# app.json `scheme: "jarvisapp"`. Not a secret -- it's a public callback URL.
+VAULT_OAUTH_REDIRECT_URIS = [
+    uri.strip()
+    for uri in os.environ.get("VAULT_OAUTH_REDIRECT_URIS", "jarvisapp://oauth/callback").split(",")
+    if uri.strip()
+]
+
+# The client_id jarvis-app's own auth.ts actually sends (hardcoded there as
+# OAUTH_CLIENT_ID, independent of VAULT_OAUTH_CLIENT_ID above which is for
+# the unrelated client_credentials grant). Pre-registered at import time in
+# oauth.py against VAULT_OAUTH_REDIRECT_URIS, since jarvis-app never calls
+# /oauth/register -- it goes straight to /oauth/authorize.
+VAULT_OAUTH_STATIC_CLIENT_ID = os.environ.get("VAULT_OAUTH_STATIC_CLIENT_ID", "jarvis-app")
+
+# Where the OAuth client registry (client_id -> redirect_uris) and the
+# per-client issued-token map persist across restarts -- small JSON beside
+# the server, 0600 (see oauth.py). Both files are gitignored; they hold live
+# session state, not source.
+OAUTH_STATE_DIR = Path(os.environ.get("VAULT_OAUTH_STATE_DIR", str(Path(__file__).resolve().parent.parent.parent)))
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation

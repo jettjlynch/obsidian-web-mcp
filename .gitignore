@@ -9,3 +9,8 @@ wheels/
 .env
 uv.lock
 .claude-flow/
+
+# OAuth client registry + issued-token store (S1, 2026-08-30) -- live
+# session state, not source. See oauth.py.
+oauth_clients.json
+oauth_tokens.json

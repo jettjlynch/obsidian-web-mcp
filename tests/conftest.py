@@ -7,6 +7,30 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_oauth_state_files(tmp_path, monkeypatch):
+    """Every test gets its own oauth client-registry/token-store files and a
+    fresh in-memory copy of both dicts -- never the real ones beside the
+    server.
+
+    Found 2026-08-30 while adding S1's per-client token store: /oauth/register
+    started persisting to disk (needed for the redirect_uri allowlist fix),
+    and the pre-existing test_oauth_register_leak.py tests call it several
+    times per run with no isolation of their own -- every `pytest` invocation
+    was appending "attacker"/"Obsidian Vault MCP Client" test registrations
+    into the real oauth_clients.json a running server would load on restart.
+    Autouse so this can't be forgotten by a future test file the same way.
+    """
+    import obsidian_vault_mcp.oauth as oauth
+
+    monkeypatch.setattr(oauth, "_CLIENTS_FILE", tmp_path / "oauth_clients.json")
+    monkeypatch.setattr(oauth, "_TOKENS_FILE", tmp_path / "oauth_tokens.json")
+    monkeypatch.setattr(oauth, "_registered_clients", {})
+    monkeypatch.setattr(oauth, "_issued_tokens", {})
+    monkeypatch.setattr(oauth, "_auth_codes", {})
+    yield
+
+
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):
     """Create a temporary vault directory with sample files."""

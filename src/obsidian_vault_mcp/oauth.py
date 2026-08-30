@@ -16,17 +16,30 @@ that meant anyone who found the hostname could complete register -> authorize ->
 token and obtain the real bearer token in two unauthenticated requests -- PKCE
 alone doesn't stop this since an attacker controls both ends of it. Fixed
 2026-08-17 (see VAULT_OAUTH_AUTHORIZE_PIN in config.py): /oauth/authorize now
-requires a PIN, entered once per client, before a code is ever issued. Everything
-downstream (PKCE, redirect_uri matching, the bearer token on MCP requests) was
-already sound and is unchanged.
+requires a PIN, entered once per client, before a code is ever issued.
+
+That closed the auto-approve hole but NOT the rest of SECURITY.md's C-1/M-1:
+redirect_uri was still unvalidated (open redirect -- a PIN-holder could still
+be steered into approving a code sent to an attacker's URI) and every
+successful flow still handed back the one shared static VAULT_MCP_TOKEN.
+Closed 2026-08-30 (S1): /oauth/authorize now checks client_id + redirect_uri
+against a real per-client exact-match allowlist (see the client registry
+below) before ever showing the PIN form, and the token endpoint issues a
+fresh per-client random token instead of the static one. The static token
+remains valid for already-issued/out-of-band consumers until S2 finishes the
+token split -- see OPERATIONS.md.
 """
 
 import hashlib
 import hmac
 import html as _html
+import json
 import logging
+import os
 import secrets
+import stat
 import time
+from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from starlette.requests import Request
@@ -47,6 +60,102 @@ def _cleanup_codes():
     expired = [k for k, v in _auth_codes.items() if v["expires_at"] < now]
     for k in expired:
         del _auth_codes[k]
+
+
+# --- Client registry + per-client token store (S1, 2026-08-30) -----------
+#
+# Closes the rest of C-1/M-1: the 2026-08-17 PIN gate stops an unauthenticated
+# caller from ever reaching approval, but /oauth/authorize still redirected to
+# whatever redirect_uri was supplied, unvalidated (open redirect), and the
+# token endpoint still handed back the one shared static VAULT_MCP_TOKEN to
+# any successful flow. This registry gives /oauth/authorize a real per-client
+# exact-match allowlist to check redirect_uri against, and lets the token
+# endpoint issue a fresh random token per client instead.
+#
+# Two JSON files beside the server (config.OAUTH_STATE_DIR), 0600, gitignored:
+#   oauth_clients.json:  client_id -> {redirect_uris: [...], client_name}
+#   oauth_tokens.json:   access_token -> {client_id, expires_at}
+
+_CLIENTS_FILE = config.OAUTH_STATE_DIR / "oauth_clients.json"
+_TOKENS_FILE = config.OAUTH_STATE_DIR / "oauth_tokens.json"
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        logger.warning(f"OAuth state file {path} unreadable/corrupt -- starting from empty")
+        return {}
+
+
+def _save_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2))
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600, matches jjvault/.env convention
+
+
+_registered_clients: dict[str, dict] = _load_json(_CLIENTS_FILE)
+_issued_tokens: dict[str, dict] = _load_json(_TOKENS_FILE)
+
+# Access-token lifetime for tokens issued by the authorization_code grant.
+# "Real lifetime, not indefinite" per the task spec -- 24h rather than a more
+# aggressive 15-60min SHOULD-tier value from SECURITY.md §5, because
+# jarvis-app's auth.ts has no refresh_token grant: expiry means re-running the
+# full PKCE flow, which now means re-entering the PIN. A short TTL would mean
+# Jett re-entering his PIN multiple times a day on his own phone for a
+# single-user personal app; 24h closes the literal "not indefinite" gap
+# without that daily-use regression. Flagging this trade-off for Jett rather
+# than silently picking a number -- tighten if he wants stronger rotation
+# (S2/H-2 already covers reuse-detection separately).
+_TOKEN_TTL_SECONDS = 86400
+
+
+def _register_client(client_id: str, redirect_uris: list[str], client_name: str = "") -> None:
+    _registered_clients[client_id] = {
+        "redirect_uris": [u for u in redirect_uris if u],
+        "client_name": client_name,
+    }
+    _save_json(_CLIENTS_FILE, _registered_clients)
+
+
+def _redirect_uri_allowed(client_id: str, redirect_uri: str) -> bool:
+    client = _registered_clients.get(client_id)
+    return bool(client) and redirect_uri in client["redirect_uris"]
+
+
+def _cleanup_tokens() -> None:
+    now = time.time()
+    expired = [t for t, v in _issued_tokens.items() if v["expires_at"] < now]
+    if expired:
+        for t in expired:
+            del _issued_tokens[t]
+        _save_json(_TOKENS_FILE, _issued_tokens)
+
+
+def _issue_token(client_id: str) -> str:
+    _cleanup_tokens()
+    token = secrets.token_urlsafe(32)
+    _issued_tokens[token] = {"client_id": client_id, "expires_at": time.time() + _TOKEN_TTL_SECONDS}
+    _save_json(_TOKENS_FILE, _issued_tokens)
+    return token
+
+
+def is_valid_issued_token(token: str) -> bool:
+    """Used by auth.py's bearer middleware alongside the legacy static token."""
+    entry = _issued_tokens.get(token)
+    return bool(entry) and entry["expires_at"] >= time.time()
+
+
+# jarvis-app never calls /oauth/register -- its own auth.ts hardcodes
+# client_id='jarvis-app' and goes straight to /oauth/authorize. Pre-register
+# it here so the allowlist check below has something to check it against.
+if config.VAULT_OAUTH_STATIC_CLIENT_ID not in _registered_clients:
+    _register_client(
+        config.VAULT_OAUTH_STATIC_CLIENT_ID,
+        config.VAULT_OAUTH_REDIRECT_URIS,
+        "jarvis-app (static, pre-registered)",
+    )
 
 
 async def oauth_metadata(request: Request) -> JSONResponse:
@@ -117,6 +226,22 @@ async def oauth_authorize(request: Request):
     }
 
     if request.method == "GET":
+        # Exact-match redirect_uri/client_id check before ever showing the
+        # PIN form -- no reason to prompt Jett for his PIN on a request that
+        # could never succeed. Query-string only: GET is the only method
+        # where these values actually live in the query string (a form POST
+        # doesn't resend it -- see the POST branch below), so this check
+        # must NOT run unconditionally for both methods or it would 400
+        # every real POST before ever reading the form body.
+        if not params["redirect_uri"] or not _redirect_uri_allowed(params["client_id"], params["redirect_uri"]):
+            logger.warning(
+                f"OAuth authorize: redirect_uri not allowed for client_id={params['client_id']!r} "
+                f"-- returning error, NOT showing the PIN form"
+            )
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "redirect_uri not registered for this client_id"},
+                status_code=400,
+            )
         return HTMLResponse(_consent_form_html(params))
 
     # POST: params travel back as hidden fields (the browser doesn't resend
@@ -125,6 +250,14 @@ async def oauth_authorize(request: Request):
     for key in params:
         params[key] = form.get(key, params[key])
     pin = form.get("pin", "")
+
+    # Re-verify against the (now form-sourced) params -- see comment above.
+    if not params["redirect_uri"] or not _redirect_uri_allowed(params["client_id"], params["redirect_uri"]):
+        logger.warning("OAuth authorize: redirect_uri/client_id failed re-check on POST -- code NOT issued")
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri not registered for this client_id"},
+            status_code=400,
+        )
 
     if not config.VAULT_OAUTH_AUTHORIZE_PIN or not hmac.compare_digest(pin, config.VAULT_OAUTH_AUTHORIZE_PIN):
         logger.warning("OAuth authorize: incorrect or missing PIN -- code NOT issued")
@@ -136,9 +269,6 @@ async def oauth_authorize(request: Request):
 
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
-
-    if not redirect_uri:
-        return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri required"}, status_code=400)
 
     # Generate authorization code
     _cleanup_codes()
@@ -218,11 +348,16 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
         if not hmac.compare_digest(computed_challenge, code_data["code_challenge"]):
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
-    logger.info("OAuth token issued via authorization_code grant")
+    # Per-client random token (S1, 2026-08-30) -- never the shared static
+    # VAULT_MCP_TOKEN. auth.py's bearer middleware accepts this alongside the
+    # static token, which stays valid for already-issued/out-of-band
+    # consumers until S2 finishes the token split (see OPERATIONS.md).
+    access_token = _issue_token(code_data["client_id"])
+    logger.info(f"OAuth token issued via authorization_code grant (client_id={code_data['client_id']!r})")
     return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
+        "access_token": access_token,
         "token_type": "bearer",
-        "expires_in": 86400,
+        "expires_in": _TOKEN_TTL_SECONDS,
     })
 
 
@@ -294,14 +429,23 @@ async def oauth_register(request: Request) -> JSONResponse:
     client_id = f"vault-mcp-{secrets.token_hex(8)}"
     # Per-client, freshly generated -- NEVER config.VAULT_OAUTH_CLIENT_SECRET.
     client_secret = secrets.token_hex(32)
+    client_name = body.get("client_name", "Obsidian Vault MCP Client")
+    redirect_uris = body.get("redirect_uris", [])
+
+    # S1 (2026-08-30): persist so /oauth/authorize can validate against this
+    # client's OWN declared redirect_uris (RFC 7591-style) -- this is what
+    # closes the open-redirect half of C-1/M-1 for dynamically-registered
+    # clients (e.g. claude.ai's MCP connector) the same way the pre-registered
+    # static entry closes it for jarvis-app, which never calls this endpoint.
+    _register_client(client_id, redirect_uris, client_name)
 
     return JSONResponse({
         "client_id": client_id,
         "client_secret": client_secret,
-        "client_name": body.get("client_name", "Obsidian Vault MCP Client"),
+        "client_name": client_name,
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
-        "redirect_uris": body.get("redirect_uris", []),
+        "redirect_uris": redirect_uris,
         "token_endpoint_auth_method": "client_secret_post",
     }, status_code=201)
 

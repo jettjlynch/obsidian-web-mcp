@@ -16,11 +16,13 @@ authenticated POST /mcp 500ing via ClosedResourceError at streamable_http.py:543
 Auth logic and responses are identical to the previous BaseHTTPMiddleware version.
 """
 
+import hmac
 import json
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import VAULT_MCP_TOKEN
+from .oauth import is_valid_issued_token
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -82,7 +84,15 @@ class BearerAuthMiddleware:
             await _send_json(send, 401, {"error": "Missing or malformed Authorization header"})
             return
 
-        if auth_header[7:] != VAULT_MCP_TOKEN:
+        token = auth_header[7:]
+        # M-2 fix (2026-08-30): was plain `!=` -- timing-unsafe string
+        # comparison on the one token that gates the whole vault. Every other
+        # secret comparison in oauth.py already used hmac.compare_digest;
+        # this was the one place that didn't.
+        # Accepts the legacy static token (still valid for already-issued /
+        # out-of-band consumers until S2 finishes the token split) OR a
+        # per-client token issued by the S1 authorization_code flow.
+        if not (hmac.compare_digest(token, VAULT_MCP_TOKEN) or is_valid_issued_token(token)):
             await _send_json(send, 401, {"error": "Invalid token"})
             return
 
