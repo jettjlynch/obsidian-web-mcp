@@ -174,9 +174,17 @@ def test_dynamically_registered_client_gets_its_own_redirect_uri_checked(monkeyp
     assert cross.status_code == 400
 
 
-# --- auth.py: static token AND per-client tokens both accepted -----------
+# --- auth.py: per-client tokens accepted, static token NO LONGER accepted -
 
-def test_bearer_middleware_accepts_static_token_and_issued_token_rejects_junk(monkeypatch, tmp_path):
+def test_bearer_middleware_rejects_static_token_and_junk_but_accepts_issued(monkeypatch, tmp_path):
+    """2026-09-05 (C-2 follow-up): the static token used to be accepted
+    here unconditionally -- that's exactly what made C-2's scope split
+    live-ineffective (claude.ai's connector had been authenticating with it
+    since before per-client tokens existed, sailing past the new scope gate
+    as "write" regardless of the consent-page checkbox). Renamed from
+    `..._accepts_static_token_and_issued_token_rejects_junk` to reflect the
+    new, intentional behavior -- this is not a relaxed assertion, it's the
+    opposite one."""
     _isolate_oauth_state(monkeypatch, tmp_path)
     from obsidian_vault_mcp.auth import BearerAuthMiddleware
 
@@ -205,12 +213,12 @@ def test_bearer_middleware_accepts_static_token_and_issued_token_rejects_junk(mo
 
     import asyncio
 
-    # Static token: still accepted.
-    assert asyncio.run(run(STATIC_TOKEN)) == 200
+    # Static token: now rejected -- the whole point of this change.
+    assert asyncio.run(run(STATIC_TOKEN)) == 401
 
-    # Freshly issued per-client token: accepted.
+    # Freshly issued per-client token: still accepted.
     issued = oauth._issue_token("jarvis-app", "read")
     assert asyncio.run(run(issued)) == 200
 
-    # Garbage token: rejected.
+    # Garbage token: rejected, unchanged.
     assert asyncio.run(run("not-a-real-token")) == 401

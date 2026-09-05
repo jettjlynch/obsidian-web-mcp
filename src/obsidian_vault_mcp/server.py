@@ -11,9 +11,12 @@ from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from .audit import audited
-from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_OAUTH_AUTHORIZE_PIN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
+from .config import VAULT_MCP_PORT, VAULT_OAUTH_AUTHORIZE_PIN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
 from .frontmatter_index import FrontmatterIndex
 
 logger = logging.getLogger(__name__)
@@ -31,6 +34,26 @@ async def lifespan(server):
     yield {"frontmatter_index": frontmatter_index}
     frontmatter_index.stop()
     logger.info("Vault MCP server shut down.")
+
+
+async def health(request: Request) -> JSONResponse:
+    """Genuinely unauthenticated liveness probe.
+
+    auth.py's _AUTH_EXEMPT_PATHS has listed "/health" since the bearer
+    middleware was written, but no route ever actually answered it -- any
+    request here 404'd (masked as harmless since nothing depended on it
+    returning real content, but misleading to anyone checking by hand, and
+    the reason mcp_watchdog.sh had to do a full authed MCP `initialize`
+    round trip instead of a cheap unauthenticated probe). Deliberately
+    minimal: process-up + "has the frontmatter index finished its initial
+    build" only -- no vault content (paths, file counts, filenames) and no
+    auth state (token/PIN/scope validity). This exists so a monitoring
+    script can poll it with no credential at all.
+    """
+    return JSONResponse({"status": "ok", "index_loaded": frontmatter_index.is_ready})
+
+
+health_routes = [Route("/health", health, methods=["GET"])]
 
 
 # Create the MCP server
@@ -389,9 +412,13 @@ def main():
     else:
         logger.info(f"Full-access mode: vault root {VAULT_PATH}")
 
-    if not VAULT_MCP_TOKEN:
-        logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
-
+    # VAULT_MCP_TOKEN no longer gates auth here at all (C-2 follow-up,
+    # 2026-09-05 -- see oauth.get_token_scope's docstring): the old "unset =
+    # auth will reject all requests" warning would now be actively wrong,
+    # since a scoped per-client token authenticates regardless of this
+    # value. The .env key itself is left alone -- app-bridge (a separate
+    # process/repo) sources this same .env file for its own, independent
+    # static-token check, untouched by this change.
     if not VAULT_OAUTH_AUTHORIZE_PIN:
         logger.warning(
             "VAULT_OAUTH_AUTHORIZE_PIN is not set -- /oauth/authorize will reject "
@@ -417,7 +444,10 @@ def main():
 
     app = mcp.streamable_http_app()
 
-    # Mount OAuth routes (these are excluded from bearer auth via the middleware)
+    # Mount /health + OAuth routes (all excluded from bearer auth via the
+    # middleware's _AUTH_EXEMPT_PATHS -- /health genuinely needs no token).
+    for route in health_routes:
+        app.routes.insert(0, route)
     for route in oauth_routes:
         app.routes.insert(0, route)
 

@@ -39,6 +39,22 @@ threads the granted scope down to audit.py's tool-wrapper choke point (same
 placement rate-limiting already uses, and for the same reason -- see
 token_scope.py) which denies write-class tools to read-scope tokens. Full
 detail: OPERATIONS.md's 2026-09-05 section, SECURITY.md's C-2 entry.
+
+2026-09-05 (C-2 follow-up, same day): the above was live-ineffective. The
+static token from the previous paragraph was STILL accepted (grandfathered
+to unconditional "write") alongside per-client ones -- and claude.ai's
+connector turned out to have been authenticating with exactly that static
+token since 2026-08-17, before per-client tokens even existed, so every
+real write sailed past the new scope gate regardless of the consent-page
+checkbox. Fixed: get_token_scope() no longer recognizes the static token at
+all (see its docstring for what was checked before removing it, and why
+this is a narrow slice of H-2/S2, not the full bind-fix-and-secret-split).
+The client_credentials grant -- which handed back that same static token --
+was removed outright rather than left issuing tokens that would now 401 on
+first use; confirmed nothing legitimate used it first (its docstring on
+oauth_token has the evidence). A real /health route was added the same day
+so mcp_watchdog.sh's automated probe -- previously a hidden consumer of the
+static token itself -- no longer needs any credential at all.
 """
 
 import hashlib
@@ -227,15 +243,28 @@ def get_token_scope(token: str) -> str | None:
     """Scope granted to `token` -- "read", "write", or None if it doesn't
     authenticate at all. This is what auth.py's bearer middleware calls.
 
-    Checks the legacy static VAULT_MCP_TOKEN first, grandfathered to "write"
-    (full access) rather than folded into the read/write split: retiring or
-    scoping the static token is H-2/S2's job specifically, out of scope for
-    this C-2 task (see SECURITY.md). Callers downstream of auth.py don't
-    need to distinguish "the legacy static token" from "a per-client token
-    that happens to have write scope" -- both just mean write access.
+    2026-09-05 (C-2 follow-up): the legacy static VAULT_MCP_TOKEN NO LONGER
+    authenticates against this server at all. Until this change it was
+    grandfathered here to unconditional "write" -- which turned out to make
+    the entire C-2 scope split live-ineffective: claude.ai's connector had
+    been authenticating with this exact static token since 2026-08-17
+    (before per-client tokens even existed), so every write it made sailed
+    straight past the new scope gate as "write" by design, regardless of
+    the consent-page checkbox. This is the narrow fix for that -- forcing
+    every real client onto the scoped per-client path C-2 already built.
+    NOT the full H-2/S2 (bridge bind fix + cross-domain secret split,
+    separate findings, still open) -- this only removes the static token's
+    authority *against this server*. The app-bridge process (port 8421,
+    separate codebase entirely) independently compares incoming requests
+    against its own copy of this same secret value and is untouched by this
+    change -- verified, not assumed (see OPERATIONS.md's 2026-09-05 §2
+    entry). Before removing this, confirmed (grepping this server's own
+    retained logs, jarvis-app's source, and this repo's docs) that nothing
+    else legitimately authenticates against *this* server with the static
+    token: jarvis-app's auth.ts, claude.ai's connector, and (as of this
+    same change) mcp_watchdog.sh's health probe all now use, or already
+    used, something other than this path.
     """
-    if config.VAULT_MCP_TOKEN and hmac.compare_digest(token, config.VAULT_MCP_TOKEN):
-        return "write"
     return get_issued_token_scope(token)
 
 
@@ -422,21 +451,47 @@ async def oauth_authorize(request: Request):
 
 
 async def oauth_token(request: Request) -> JSONResponse:
-    """OAuth 2.0 token endpoint -- authorization code grant with PKCE."""
+    """OAuth 2.0 token endpoint -- authorization code grant with PKCE.
+
+    client_credentials grant REMOVED 2026-09-05 (C-2 follow-up, checked
+    before removing per the task's own instruction, not assumed): the only
+    trace of it anywhere in this server's retained logs is a single FAILED
+    attempt (2026-08-18 08:16:44, tied to the register-leak/PIN-gate-bypass
+    incident that day's emergency fix closed) -- zero successful
+    "OAuth token issued via client_credentials grant" log lines exist,
+    ever. No legitimate client uses it: jarvis-app's auth.ts and claude.ai's
+    registered connector both go through authorization_code exclusively,
+    and this server's own oauth_metadata() has only ever advertised
+    ["authorization_code"] in grant_types_supported -- client_credentials
+    was never even a documented feature. It also handed back the raw static
+    VAULT_MCP_TOKEN, which would 401 on first real use once the static
+    token stops authenticating at all (see get_token_scope) -- a grant that
+    "succeeds" but issues a dead token is worse than one that fails
+    honestly. Removed outright rather than left to silently rot. Detail:
+    OPERATIONS.md's 2026-09-05 section.
+    """
     try:
         form = await request.form()
     except Exception:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     grant_type = form.get("grant_type", "")
-    client_id = form.get("client_id", "")
-    client_secret = form.get("client_secret", "")
 
-    # Support both authorization_code and client_credentials grants
     if grant_type == "authorization_code":
+        client_id = form.get("client_id", "")
+        client_secret = form.get("client_secret", "")
         return await _handle_authorization_code(form, client_id, client_secret)
     elif grant_type == "client_credentials":
-        return await _handle_client_credentials(client_id, client_secret)
+        return JSONResponse(
+            {
+                "error": "unsupported_grant_type",
+                "error_description": (
+                    "client_credentials is disabled on this server -- use "
+                    "authorization_code (PKCE)."
+                ),
+            },
+            status_code=400,
+        )
     else:
         return JSONResponse(
             {"error": "unsupported_grant_type"},
@@ -493,29 +548,6 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
         "scope": scope,
     })
 
-
-async def _handle_client_credentials(client_id: str, client_secret: str) -> JSONResponse:
-    """Exchange client credentials for a bearer token."""
-    if not config.VAULT_OAUTH_CLIENT_SECRET:
-        return JSONResponse({"error": "server_error"}, status_code=500)
-
-    id_match = hmac.compare_digest(client_id, config.VAULT_OAUTH_CLIENT_ID)
-    secret_match = hmac.compare_digest(client_secret, config.VAULT_OAUTH_CLIENT_SECRET)
-
-    if not (id_match and secret_match):
-        logger.warning(f"OAuth client_credentials failed (client_id={client_id!r})")
-        return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-    logger.info("OAuth token issued via client_credentials grant")
-    return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
-        "token_type": "bearer",
-        "expires_in": 86400,
-        # This grant hands back the legacy static token, which get_token_scope()
-        # grandfathers to "write" (see its docstring -- H-2/S2's territory, not
-        # this task's). Reported here for transparency, not a behavior change.
-        "scope": "write",
-    })
 
 
 async def oauth_protected_resource(request: Request) -> JSONResponse:

@@ -15,22 +15,23 @@ Root-caused 2026-06-15 (claude.ai Obsidian connector "returned an error":
 authenticated POST /mcp 500ing via ClosedResourceError at streamable_http.py:543).
 Auth logic and responses are identical to the previous BaseHTTPMiddleware version.
 
-C-2 (2026-09-05): this middleware now also determines the *scope* the
-presented token was granted (via oauth.get_token_scope -- static token
-grandfathered to "write", per-client tokens carry whatever the consent page
-approved) and records it in token_scope.current_scope for the duration of
-the request. It does NOT gate individual tools here -- which tool is being
-called isn't known until the JSON-RPC body is parsed, well downstream of
-this pure-ASGI middleware (same reasoning rate_limit.py documents for why
-its own enforcement lives at the tool-wrapper layer, not here). See
-token_scope.py and audit.py's `audited()` decorator for the actual gate.
+C-2 (2026-09-05): this middleware also determines the *scope* the presented
+token was granted (via oauth.get_token_scope -- per-client tokens carry
+whatever the consent page approved; the legacy static VAULT_MCP_TOKEN no
+longer authenticates against this server at all as of the same day's
+follow-up, see get_token_scope's docstring) and records it in
+token_scope.current_scope for the duration of the request. It does NOT gate
+individual tools here -- which tool is being called isn't known until the
+JSON-RPC body is parsed, well downstream of this pure-ASGI middleware (same
+reasoning rate_limit.py documents for why its own enforcement lives at the
+tool-wrapper layer, not here). See token_scope.py and audit.py's
+`audited()` decorator for the actual gate.
 """
 
 import json
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .config import VAULT_MCP_TOKEN
 from .oauth import get_token_scope
 from . import token_scope
 
@@ -79,10 +80,6 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if not VAULT_MCP_TOKEN:
-            await _send_json(send, 500, {"error": "Server misconfigured: no auth token set"})
-            return
-
         # ASGI headers: list of (name, value) byte tuples; names are lowercased.
         auth_header = ""
         for name, value in scope.get("headers", []):
@@ -95,12 +92,11 @@ class BearerAuthMiddleware:
             return
 
         token = auth_header[7:]
-        # get_token_scope does the actual comparisons (hmac.compare_digest
-        # throughout -- M-2 fix, 2026-08-30): the legacy static token (still
-        # valid for already-issued/out-of-band consumers until S2 finishes
-        # the token split) grandfathered to "write", or whatever scope a
-        # per-client token issued by the S1 flow was granted (C-2,
-        # 2026-09-05). None means neither -- invalid token.
+        # get_token_scope looks up whatever scope a per-client token issued
+        # by the S1/C-2 OAuth flow was granted. The legacy static token no
+        # longer authenticates here at all (C-2 follow-up, 2026-09-05 -- see
+        # get_token_scope's docstring for why and what was checked first).
+        # None means the token is unknown/expired -- invalid.
         granted_scope = get_token_scope(token)
         if granted_scope is None:
             await _send_json(send, 401, {"error": "Invalid token"})

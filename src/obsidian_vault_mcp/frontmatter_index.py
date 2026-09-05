@@ -63,6 +63,16 @@ class FrontmatterIndex:
         with self._lock:
             return len(self._index)
 
+    @property
+    def is_ready(self) -> bool:
+        """Whether start() has completed its initial build and the
+        filesystem observer is actively watching. Pure liveness signal for
+        /health -- exposes no vault content, just "has this finished
+        booting", so a public property rather than reaching into
+        _observer directly from outside the class.
+        """
+        return self._observer is not None
+
     def search_by_field(
         self,
         field: str,

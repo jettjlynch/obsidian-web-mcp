@@ -9,9 +9,13 @@ unauthenticated requests yielded the real VAULT_MCP_TOKEN. Root-caused while
 merging in jimprosser/obsidian-web-mcp's independent fix for the same bug
 class (their commit e4924f0).
 
-This locks in both directions: the leak stays closed, AND a legitimate
-client that already has the real VAULT_OAUTH_CLIENT_SECRET configured
-out-of-band (never obtained via /oauth/register) still works.
+2026-09-05: the client_credentials grant this bug depended on was removed
+outright (C-2 follow-up -- checked first, nothing legitimate ever used it;
+see oauth_token's docstring and OPERATIONS.md). The exploit path this file
+guards against is now closed twice over: the leak fix below, AND the grant
+it would have been redeemed against no longer exists at all. Kept both
+tests (updated for the new response shape) rather than deleted, since the
+register-leak half is a real, independent regression risk on its own.
 """
 
 from starlette.applications import Starlette
@@ -38,7 +42,12 @@ def test_register_does_not_return_the_shared_secret(monkeypatch):
 
 
 def test_registered_secret_cannot_obtain_a_token_via_client_credentials(monkeypatch):
-    """The core exploit: register, then try to use what it gave you."""
+    """The core exploit: register, then try to use what it gave you.
+
+    Was a 401 (invalid_client) when the grant still existed; now a flat 400
+    (unsupported_grant_type) since the grant was removed entirely -- either
+    way, no token, which is what this test actually guards.
+    """
     client = _client(monkeypatch)
     reg = client.post("/oauth/register", json={"client_name": "attacker"}).json()
 
@@ -47,20 +56,23 @@ def test_registered_secret_cannot_obtain_a_token_via_client_credentials(monkeypa
         "client_id": reg["client_id"],
         "client_secret": reg["client_secret"],
     })
-    assert resp.status_code == 401
+    assert resp.status_code == 400
     assert "access_token" not in resp.json()
 
 
-def test_legitimate_client_credentials_still_works_with_the_real_secret(monkeypatch):
-    """No regression: whoever has the real out-of-band secret still gets a token."""
+def test_client_credentials_is_disabled_even_with_the_real_secret(monkeypatch):
+    """2026-09-05: the grant is gone outright, not just gated -- confirmed
+    nothing legitimate used it (see oauth_token's docstring) before removing
+    it, so even the real out-of-band secret no longer gets a token this way."""
     client = _client(monkeypatch)
     resp = client.post("/oauth/token", data={
         "grant_type": "client_credentials",
         "client_id": "vault-mcp-client",
         "client_secret": "the-real-shared-secret",
     })
-    assert resp.status_code == 200
-    assert resp.json()["access_token"] == "the-real-bearer-token"
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "unsupported_grant_type"
+    assert "access_token" not in resp.json()
 
 
 def test_two_registrations_get_different_secrets(monkeypatch):

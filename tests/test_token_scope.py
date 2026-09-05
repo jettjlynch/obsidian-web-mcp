@@ -344,9 +344,18 @@ def test_pkce_flow_with_checkbox_ticked_issues_write_token(monkeypatch, tmp_path
     assert oauth.get_issued_token_scope(body["access_token"]) == "write"
 
 
-def test_client_credentials_grant_reports_write_scope(monkeypatch, tmp_path):
-    """Unchanged behavior (H-2's territory) -- just confirms the response now
-    honestly reports what it already grants."""
+def test_client_credentials_grant_is_disabled(monkeypatch, tmp_path):
+    """2026-09-05, C-2 follow-up: removed outright, not just left alone.
+
+    Checked first (see oauth_token's docstring / OPERATIONS.md) -- the only
+    trace of this grant in this server's history is one FAILED attempt
+    (2026-08-18, tied to the register-leak incident), zero successful uses,
+    ever. It also handed back the raw static token, which would 401 on
+    first real use once that token stops authenticating (this same C-2
+    follow-up) -- a grant that "succeeds" but issues a dead token is worse
+    than one that fails honestly. Even the real, correctly-configured
+    secret now gets a flat unsupported_grant_type.
+    """
     _isolate_oauth_state(monkeypatch, tmp_path)
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_ID", "creds-client")
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "creds-secret")
@@ -361,15 +370,21 @@ def test_client_credentials_grant_reports_write_scope(monkeypatch, tmp_path):
         "client_id": "creds-client",
         "client_secret": "creds-secret",
     })
-    assert resp.status_code == 200
-    assert resp.json()["scope"] == "write"
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "unsupported_grant_type"
+    assert "access_token" not in resp.json()
 
 
 # --- get_token_scope: static-token grandfather + invalid tokens -----------
 
-def test_get_token_scope_static_token_is_write(monkeypatch, tmp_path):
+def test_get_token_scope_static_token_no_longer_authenticates(monkeypatch, tmp_path):
+    """2026-09-05 (C-2 follow-up): was grandfathered to "write" unconditionally,
+    which made the whole scope split live-ineffective for claude.ai's
+    connector (it had been using this exact token since before per-client
+    tokens existed). Now the static token is just another unrecognized
+    string as far as this server's own auth is concerned."""
     _isolate_oauth_state(monkeypatch, tmp_path)
-    assert oauth.get_token_scope(STATIC_TOKEN) == "write"
+    assert oauth.get_token_scope(STATIC_TOKEN) is None
 
 
 def test_get_token_scope_unknown_token_is_none(monkeypatch, tmp_path):
