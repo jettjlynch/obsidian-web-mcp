@@ -14,15 +14,25 @@ streams stay open.
 Root-caused 2026-06-15 (claude.ai Obsidian connector "returned an error":
 authenticated POST /mcp 500ing via ClosedResourceError at streamable_http.py:543).
 Auth logic and responses are identical to the previous BaseHTTPMiddleware version.
+
+C-2 (2026-09-05): this middleware now also determines the *scope* the
+presented token was granted (via oauth.get_token_scope -- static token
+grandfathered to "write", per-client tokens carry whatever the consent page
+approved) and records it in token_scope.current_scope for the duration of
+the request. It does NOT gate individual tools here -- which tool is being
+called isn't known until the JSON-RPC body is parsed, well downstream of
+this pure-ASGI middleware (same reasoning rate_limit.py documents for why
+its own enforcement lives at the tool-wrapper layer, not here). See
+token_scope.py and audit.py's `audited()` decorator for the actual gate.
 """
 
-import hmac
 import json
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import VAULT_MCP_TOKEN
-from .oauth import is_valid_issued_token
+from .oauth import get_token_scope
+from . import token_scope
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -85,15 +95,22 @@ class BearerAuthMiddleware:
             return
 
         token = auth_header[7:]
-        # M-2 fix (2026-08-30): was plain `!=` -- timing-unsafe string
-        # comparison on the one token that gates the whole vault. Every other
-        # secret comparison in oauth.py already used hmac.compare_digest;
-        # this was the one place that didn't.
-        # Accepts the legacy static token (still valid for already-issued /
-        # out-of-band consumers until S2 finishes the token split) OR a
-        # per-client token issued by the S1 authorization_code flow.
-        if not (hmac.compare_digest(token, VAULT_MCP_TOKEN) or is_valid_issued_token(token)):
+        # get_token_scope does the actual comparisons (hmac.compare_digest
+        # throughout -- M-2 fix, 2026-08-30): the legacy static token (still
+        # valid for already-issued/out-of-band consumers until S2 finishes
+        # the token split) grandfathered to "write", or whatever scope a
+        # per-client token issued by the S1 flow was granted (C-2,
+        # 2026-09-05). None means neither -- invalid token.
+        granted_scope = get_token_scope(token)
+        if granted_scope is None:
             await _send_json(send, 401, {"error": "Invalid token"})
             return
 
-        await self.app(scope, receive, send)
+        # Thread the granted scope down to audit.py's tool-wrapper gate for
+        # the lifetime of this request only -- see token_scope.py and this
+        # module's docstring for why the gate itself can't live here.
+        scope_reset = token_scope.current_scope.set(granted_scope)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            token_scope.current_scope.reset(scope_reset)

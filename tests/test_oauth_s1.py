@@ -139,6 +139,10 @@ def test_full_pkce_flow_issues_a_fresh_token_not_the_static_one(monkeypatch, tmp
     assert body["access_token"] != STATIC_TOKEN
     assert body["expires_in"] == oauth._TOKEN_TTL_SECONDS
     assert oauth.is_valid_issued_token(body["access_token"])
+    # C-2 (2026-09-05): the consent form's write checkbox was never ticked
+    # above, so this must default to read-only, not silently grant write.
+    assert body["scope"] == "read"
+    assert oauth.get_issued_token_scope(body["access_token"]) == "read"
 
 
 def test_dynamically_registered_client_gets_its_own_redirect_uri_checked(monkeypatch, tmp_path):
@@ -205,7 +209,7 @@ def test_bearer_middleware_accepts_static_token_and_issued_token_rejects_junk(mo
     assert asyncio.run(run(STATIC_TOKEN)) == 200
 
     # Freshly issued per-client token: accepted.
-    issued = oauth._issue_token("jarvis-app")
+    issued = oauth._issue_token("jarvis-app", "read")
     assert asyncio.run(run(issued)) == 200
 
     # Garbage token: rejected.

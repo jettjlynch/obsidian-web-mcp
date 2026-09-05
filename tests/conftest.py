@@ -31,6 +31,27 @@ def _isolate_oauth_state_files(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _default_full_token_scope():
+    """Default every test to a fully-authorized (write) token-scope context.
+
+    Added 2026-09-05 alongside the C-2 read/write scope split: most existing
+    tests exercise tool business logic or rate-limiting, not auth, and
+    predate the concept of a per-request granted scope entirely. Without
+    this, audit.py's new scope gate would fail-closed on every one of them
+    (token_scope.current_scope defaults to None -- "no scope determined" --
+    outside of a real HTTP request through auth.py's middleware), which
+    isn't what those tests are checking and would be a false regression, not
+    a real one. Tests that actually exercise scope enforcement (see
+    test_token_scope.py) override this explicitly within their own body.
+    """
+    from obsidian_vault_mcp import token_scope
+
+    reset_token = token_scope.current_scope.set("write")
+    yield
+    token_scope.current_scope.reset(reset_token)
+
+
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):
     """Create a temporary vault directory with sample files."""

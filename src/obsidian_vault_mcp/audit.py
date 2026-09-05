@@ -14,6 +14,13 @@ Deliberately logs only path/identifier-shaped arguments (which file, which
 tag, which query), never `content`/`find`/`replace`/`new_content` bodies --
 otherwise the audit log becomes a second, less-protected copy of the vault
 itself, which defeats the point of an audit trail.
+
+C-2 (2026-09-05): this is also where the read/write token-scope split is
+enforced -- the same choke point rate-limiting already uses, and for the
+same reason (see rate_limit.py's module docstring): auth.py's ASGI
+middleware knows a token's granted scope but never learns which tool is
+being called, since it never parses the JSON-RPC body. By the time `wrapper`
+runs here, both are known.
 """
 
 import functools
@@ -22,6 +29,7 @@ import logging
 import time
 
 from . import rate_limit
+from . import token_scope
 
 logger = logging.getLogger("obsidian_vault_mcp.audit")
 
@@ -59,6 +67,22 @@ def _extract_error(result) -> str | None:
     return parsed.get("error") if isinstance(parsed, dict) else None
 
 
+def _scope_allows(kind: str, granted: str | None) -> bool:
+    """Whether a token granted `granted` scope may call a `kind`-class tool.
+
+    write-class tools require the token's granted scope to be exactly
+    "write". read-class tools accept either "read" or "write" (write
+    implies read). `granted=None` -- no scope was ever determined for this
+    request, which should not happen for any real HTTP request (auth.py's
+    bearer middleware sets this before a tool can be reached at all -- see
+    token_scope.py) -- fails closed for both kinds, matching this server's
+    fail-closed posture elsewhere (e.g. an unset OAuth PIN).
+    """
+    if granted not in ("read", "write"):
+        return False
+    return granted == "write" if kind == "write" else True
+
+
 def audited(tool_name: str, kind: str | None = None):
     """Decorator: log every call to a vault tool with args, outcome, and duration.
 
@@ -67,12 +91,18 @@ def audited(tool_name: str, kind: str | None = None):
     introspection for the tool schema still sees the real parameters).
 
     `kind` is "read" or "write" (matching each tool's readOnlyHint annotation
-    in server.py) or None to skip rate limiting entirely (used for tools that
-    are neither, if any are ever added). When set, enforces
-    RATE_LIMIT_READ/RATE_LIMIT_WRITE (see rate_limit.py) before calling
-    through -- a rejected call short-circuits fn entirely and is logged the
-    same as any other error result, not raised, so it reaches the caller as
-    a normal tool-error JSON body rather than an MCP-level exception.
+    in server.py) or None to skip rate limiting AND scope enforcement
+    entirely (used for tools that are neither, if any are ever added). When
+    set, enforces two gates in order, before calling through:
+
+    1. Token scope (C-2, 2026-09-05): the calling token must have been
+       granted at least `kind`-level access (see _scope_allows and
+       token_scope.py) or the call is denied outright.
+    2. RATE_LIMIT_READ/RATE_LIMIT_WRITE (see rate_limit.py).
+
+    Either rejection short-circuits fn entirely and is logged the same as
+    any other error result, not raised, so it reaches the caller as a normal
+    tool-error JSON body rather than an MCP-level exception.
     """
     def decorator(fn):
         @functools.wraps(fn)
@@ -83,6 +113,24 @@ def audited(tool_name: str, kind: str | None = None):
             start = time.monotonic()
 
             if kind is not None:
+                granted = token_scope.current_scope.get()
+                if not _scope_allows(kind, granted):
+                    needed = "write" if kind == "write" else "read"
+                    reason = (
+                        f"the presented token only has {granted!r} scope"
+                        if granted is not None
+                        else "no valid scope was found for this request"
+                    )
+                    message = f"{tool_name} requires {needed}-scope access; {reason}."
+                    result = json.dumps({"error": message})
+                    entry["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
+                    entry["ok"] = False
+                    entry["error"] = message
+                    entry["scope_denied"] = True
+                    entry["granted_scope"] = granted
+                    logger.info(json.dumps(entry))
+                    return result
+
                 try:
                     rate_limit.check(kind)
                 except rate_limit.RateLimitExceeded as e:
@@ -109,5 +157,12 @@ def audited(tool_name: str, kind: str | None = None):
                 entry["error"] = error
             logger.info(json.dumps(entry))
             return result
+        # Exposed for tests (see test_token_scope.py) to introspect every
+        # real registered tool's declared kind without hand-maintaining a
+        # separate read/write tool list that can drift from server.py's own
+        # annotations. `@mcp.tool()` (applied outside this decorator in
+        # server.py) returns fn unchanged, so this attribute survives onto
+        # the final module-level name, e.g. server.vault_write.audit_kind.
+        wrapper.audit_kind = kind
         return wrapper
     return decorator

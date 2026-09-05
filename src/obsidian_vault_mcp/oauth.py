@@ -28,6 +28,17 @@ below) before ever showing the PIN form, and the token endpoint issues a
 fresh per-client random token instead of the static one. The static token
 remains valid for already-issued/out-of-band consumers until S2 finishes the
 token split -- see OPERATIONS.md.
+
+2026-09-05 (C-2): S1 closed *how* a token is minted but not *what it grants*
+-- every per-client token issued above was still handed the exact same
+access as the static one: vault_write/append/delete/move/etc were all
+reachable by anything that authenticated at all. The consent page now
+carries a write-access checkbox (default UNCHECKED) alongside the PIN;
+issued tokens carry a "read" or "write" scope accordingly, and auth.py
+threads the granted scope down to audit.py's tool-wrapper choke point (same
+placement rate-limiting already uses, and for the same reason -- see
+token_scope.py) which denies write-class tools to read-scope tokens. Full
+detail: OPERATIONS.md's 2026-09-05 section, SECURITY.md's C-2 entry.
 """
 
 import hashlib
@@ -74,7 +85,8 @@ def _cleanup_codes():
 #
 # Two JSON files beside the server (config.OAUTH_STATE_DIR), 0600, gitignored:
 #   oauth_clients.json:  client_id -> {redirect_uris: [...], client_name}
-#   oauth_tokens.json:   access_token -> {client_id, expires_at}
+#   oauth_tokens.json:   access_token -> {client_id, expires_at, scope}
+#                         scope is "read" or "write" (C-2, 2026-09-05).
 
 _CLIENTS_FILE = config.OAUTH_STATE_DIR / "oauth_clients.json"
 _TOKENS_FILE = config.OAUTH_STATE_DIR / "oauth_tokens.json"
@@ -97,6 +109,42 @@ def _save_json(path: Path, data: dict) -> None:
 
 _registered_clients: dict[str, dict] = _load_json(_CLIENTS_FILE)
 _issued_tokens: dict[str, dict] = _load_json(_TOKENS_FILE)
+
+
+def _purge_unscoped_tokens() -> int:
+    """C-2 migration (2026-09-05): tokens issued by S1 (2026-08-30) through
+    today have no "scope" key -- they predate the read/write split entirely.
+
+    Explicit decision, not a default worth burying in a comment: these are
+    NOT grandfathered into write access. That would silently hand full
+    access to whatever happened to hold a token at deploy time, which is
+    exactly the kind of silent-grant this task exists to close. Instead they
+    are invalidated outright -- the holder's next request 401s, which for
+    both real clients (jarvis-app, claude.ai's connector) means transparently
+    re-running the existing PKCE + PIN flow and getting back a real, scoped
+    token. Cost is bounded: tokens are already TTL'd at 24h, so this is at
+    most one extra unscheduled re-auth, not a standing outage.
+
+    Returns the number of entries purged (0 on a fresh store or one that's
+    already fully migrated) -- called once at import time below, and exposed
+    here as its own function so tests can exercise the migration without
+    needing to reimport the module.
+    """
+    unscoped = [t for t, v in _issued_tokens.items() if "scope" not in v]
+    if not unscoped:
+        return 0
+    logger.warning(
+        f"Token-scope migration: purging {len(unscoped)} pre-scope issued "
+        f"token(s) issued before the C-2 read/write split -- holders must "
+        f"re-authorize to get a scoped token."
+    )
+    for t in unscoped:
+        del _issued_tokens[t]
+    _save_json(_TOKENS_FILE, _issued_tokens)
+    return len(unscoped)
+
+
+_purge_unscoped_tokens()
 
 # Access-token lifetime for tokens issued by the authorization_code grant.
 # "Real lifetime, not indefinite" per the task spec -- 24h rather than a more
@@ -133,18 +181,62 @@ def _cleanup_tokens() -> None:
         _save_json(_TOKENS_FILE, _issued_tokens)
 
 
-def _issue_token(client_id: str) -> str:
+def _issue_token(client_id: str, scope: str) -> str:
+    """`scope` is required, not defaulted -- every call site (there is
+    exactly one, _handle_authorization_code below) must say explicitly what
+    it's granting rather than relying on an implicit default that could
+    silently change meaning later. The default-to-read-unless-approved
+    *policy* lives in oauth_authorize's consent-form handling, not here.
+    """
+    if scope not in ("read", "write"):
+        raise ValueError(f"invalid token scope: {scope!r}")
     _cleanup_tokens()
     token = secrets.token_urlsafe(32)
-    _issued_tokens[token] = {"client_id": client_id, "expires_at": time.time() + _TOKEN_TTL_SECONDS}
+    _issued_tokens[token] = {
+        "client_id": client_id,
+        "expires_at": time.time() + _TOKEN_TTL_SECONDS,
+        "scope": scope,
+    }
     _save_json(_TOKENS_FILE, _issued_tokens)
     return token
 
 
 def is_valid_issued_token(token: str) -> bool:
-    """Used by auth.py's bearer middleware alongside the legacy static token."""
+    """Is `token` a currently-valid per-client issued token (NOT the legacy
+    static token -- that's a separate check, see get_token_scope). Used by
+    tests to confirm a token came from the real per-client issuance path.
+    """
     entry = _issued_tokens.get(token)
     return bool(entry) and entry["expires_at"] >= time.time()
+
+
+def get_issued_token_scope(token: str) -> str | None:
+    """Scope of a currently-valid per-client issued token, or None if it's
+    unknown/expired/missing (including a pre-migration entry that somehow
+    survived _purge_unscoped_tokens() -- treated as ungranted, fail closed,
+    rather than assumed).
+    """
+    _cleanup_tokens()
+    entry = _issued_tokens.get(token)
+    if not entry or entry["expires_at"] < time.time():
+        return None
+    return entry.get("scope")
+
+
+def get_token_scope(token: str) -> str | None:
+    """Scope granted to `token` -- "read", "write", or None if it doesn't
+    authenticate at all. This is what auth.py's bearer middleware calls.
+
+    Checks the legacy static VAULT_MCP_TOKEN first, grandfathered to "write"
+    (full access) rather than folded into the read/write split: retiring or
+    scoping the static token is H-2/S2's job specifically, out of scope for
+    this C-2 task (see SECURITY.md). Callers downstream of auth.py don't
+    need to distinguish "the legacy static token" from "a per-client token
+    that happens to have write scope" -- both just mean write access.
+    """
+    if config.VAULT_MCP_TOKEN and hmac.compare_digest(token, config.VAULT_MCP_TOKEN):
+        return "write"
+    return get_issued_token_scope(token)
 
 
 # jarvis-app never calls /oauth/register -- its own auth.ts hardcodes
@@ -173,7 +265,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
     })
 
 
-def _consent_form_html(params: dict, error: str | None = None) -> str:
+def _consent_form_html(params: dict, error: str | None = None, requested_scope: str = "read") -> str:
     """Minimal PIN-entry consent page. Renders fine inside claude.ai's browser
     redirect and jarvis-app's ASWebAuthenticationSession alike -- both are real
     interactive browser contexts, this is a normal OAuth consent screen.
@@ -181,12 +273,23 @@ def _consent_form_html(params: dict, error: str | None = None) -> str:
     All param values are attacker-influenceable (they come straight off the
     incoming request) and get echoed back as hidden fields, so they're
     HTML-escaped before embedding.
+
+    C-2 (2026-09-05): the write-access checkbox is what makes write scope
+    "explicitly requested/approved" rather than silently granted -- it's
+    UNCHECKED by default regardless of what the client asked for.
+    `requested_scope` only pre-checks the box as a convenience when the
+    client's authorize request hinted scope=write; the human still has to
+    see it checked and submit with the correct PIN for it to mean anything.
+    Nothing about the granted scope is trusted from a hidden field -- the
+    checkbox's on-submit state is the only input read back (see
+    oauth_authorize's POST branch).
     """
     hidden = "\n".join(
         f'<input type="hidden" name="{_html.escape(k)}" value="{_html.escape(v or "")}">'
         for k, v in params.items()
     )
     error_html = f'<p style="color:#c00">{_html.escape(error)}</p>' if error else ""
+    write_checked = "checked" if requested_scope == "write" else ""
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Authorize Vault Access</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -195,6 +298,9 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 3
         margin: 4rem auto; padding: 0 1rem; }}
 input[type=password] {{ width: 100%; padding: 0.6rem; font-size: 1rem; box-sizing: border-box;
                          margin-top: 0.75rem; }}
+label.scope {{ display: flex; align-items: flex-start; gap: 0.5rem; margin-top: 1rem;
+               font-size: 0.85rem; line-height: 1.3; }}
+label.scope input {{ margin-top: 0.2rem; }}
 button {{ width: 100%; margin-top: 1rem; padding: 0.7rem; font-size: 1rem; }}
 </style></head>
 <body>
@@ -203,6 +309,10 @@ button {{ width: 100%; margin-top: 1rem; padding: 0.7rem; font-size: 1rem; }}
 {error_html}
 <form method="POST">
 {hidden}
+<label class="scope">
+<input type="checkbox" name="scope" value="write" {write_checked}>
+<span>Also allow <strong>write access</strong> (create, edit, delete, and move notes). Unchecked grants read-only.</span>
+</label>
 <input type="password" name="pin" placeholder="PIN" autofocus required autocomplete="off">
 <button type="submit">Approve</button>
 </form>
@@ -242,7 +352,13 @@ async def oauth_authorize(request: Request):
                 {"error": "invalid_request", "error_description": "redirect_uri not registered for this client_id"},
                 status_code=400,
             )
-        return HTMLResponse(_consent_form_html(params))
+        # C-2: a client MAY hint scope=write in the query string to pre-check
+        # the consent-page box (pure UX -- e.g. so claude.ai's connector
+        # doesn't force Jett to hunt for the checkbox every time). This hint
+        # is never trusted as the granted scope by itself; only the box's
+        # state on actual form submission is (see the POST branch).
+        requested_scope = "write" if request.query_params.get("scope") == "write" else "read"
+        return HTMLResponse(_consent_form_html(params, requested_scope=requested_scope))
 
     # POST: params travel back as hidden fields (the browser doesn't resend
     # the original query string on form submission).
@@ -250,6 +366,10 @@ async def oauth_authorize(request: Request):
     for key in params:
         params[key] = form.get(key, params[key])
     pin = form.get("pin", "")
+    # C-2: unchecked checkboxes are simply absent from form data (standard
+    # HTML behavior) -- form.get("scope") is None unless the box was ticked,
+    # so this defaults to "read" with no separate default branch needed.
+    scope = "write" if form.get("scope") == "write" else "read"
 
     # Re-verify against the (now form-sourced) params -- see comment above.
     if not params["redirect_uri"] or not _redirect_uri_allowed(params["client_id"], params["redirect_uri"]):
@@ -261,7 +381,9 @@ async def oauth_authorize(request: Request):
 
     if not config.VAULT_OAUTH_AUTHORIZE_PIN or not hmac.compare_digest(pin, config.VAULT_OAUTH_AUTHORIZE_PIN):
         logger.warning("OAuth authorize: incorrect or missing PIN -- code NOT issued")
-        return HTMLResponse(_consent_form_html(params, error="Incorrect PIN."), status_code=401)
+        return HTMLResponse(
+            _consent_form_html(params, error="Incorrect PIN.", requested_scope=scope), status_code=401
+        )
 
     response_type = params["response_type"]
     redirect_uri = params["redirect_uri"]
@@ -278,10 +400,14 @@ async def oauth_authorize(request: Request):
         "redirect_uri": redirect_uri,
         "code_challenge": params["code_challenge"],
         "code_challenge_method": params["code_challenge_method"],
+        "scope": scope,
         "expires_at": time.time() + 300,  # 5 minute expiry
     }
 
-    logger.info(f"OAuth authorization code issued (PIN verified), redirecting to {redirect_uri[:50]}...")
+    logger.info(
+        f"OAuth authorization code issued (PIN verified, scope={scope!r}), "
+        f"redirecting to {redirect_uri[:50]}..."
+    )
 
     # Redirect back to Claude with the code
     out = {"code": code}
@@ -352,12 +478,19 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
     # VAULT_MCP_TOKEN. auth.py's bearer middleware accepts this alongside the
     # static token, which stays valid for already-issued/out-of-band
     # consumers until S2 finishes the token split (see OPERATIONS.md).
-    access_token = _issue_token(code_data["client_id"])
-    logger.info(f"OAuth token issued via authorization_code grant (client_id={code_data['client_id']!r})")
+    # Scope (C-2, 2026-09-05) is whatever was approved on the consent page --
+    # "read" unless the write checkbox was ticked; see oauth_authorize.
+    scope = code_data["scope"]
+    access_token = _issue_token(code_data["client_id"], scope)
+    logger.info(
+        f"OAuth token issued via authorization_code grant "
+        f"(client_id={code_data['client_id']!r}, scope={scope!r})"
+    )
     return JSONResponse({
         "access_token": access_token,
         "token_type": "bearer",
         "expires_in": _TOKEN_TTL_SECONDS,
+        "scope": scope,
     })
 
 
@@ -378,6 +511,10 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
         "access_token": config.VAULT_MCP_TOKEN,
         "token_type": "bearer",
         "expires_in": 86400,
+        # This grant hands back the legacy static token, which get_token_scope()
+        # grandfathers to "write" (see its docstring -- H-2/S2's territory, not
+        # this task's). Reported here for transparency, not a behavior change.
+        "scope": "write",
     })
 
 
