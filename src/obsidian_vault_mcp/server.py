@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from . import config
 from .audit import audited
 from .config import VAULT_MCP_PORT, VAULT_OAUTH_AUTHORIZE_PIN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
 from .frontmatter_index import FrontmatterIndex
@@ -24,15 +25,80 @@ logger = logging.getLogger(__name__)
 # Global frontmatter index instance
 frontmatter_index = FrontmatterIndex()
 
+# Semantic retrieval globals (RETRIEVAL-DESIGN.md / PORT-DESIGN.md). None
+# until main() wires them up -- only happens when RETRIEVAL_ENABLED is set,
+# see main()'s "Semantic retrieval" section. vault_search_semantic
+# (tools/search.py) checks these for None and reports itself unconfigured
+# rather than failing.
+retrieval_store = None
+retrieval_embedder = None
+retrieval_indexer = None
+
 
 @asynccontextmanager
 async def lifespan(server):
     """Start frontmatter index on server startup, stop on shutdown."""
     logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+
+    # Semantic retrieval (RETRIEVAL-DESIGN.md / PORT-DESIGN.md): optional,
+    # additive, OFF unless RETRIEVAL_ENABLED is explicitly set -- absent
+    # that, the tool exists but reports itself unconfigured (see
+    # tools/search.py::vault_search_semantic), and nothing here touches
+    # RETRIEVAL_DB_PATH or makes any embedding calls. Registered as a
+    # frontmatter_index change-listener BEFORE start() so the watcher thread
+    # never has a gap where it's running without one; per §2.3 this keeps
+    # re-indexing incremental on every future change, hooked into the SAME
+    # watcher (extend, don't stand up a second Observer -- see
+    # frontmatter_index.py's ChangeListener docstring for why that matters).
+    global retrieval_store, retrieval_embedder, retrieval_indexer
+    if config.RETRIEVAL_ENABLED:
+        from .retrieval.indexer import RetrievalIndexer
+        from .retrieval.store import RetrievalStore
+
+        if config.RETRIEVAL_EMBEDDING_BACKEND == "voyage":
+            from .retrieval.embeddings import VoyageEmbedder
+            if not config.VOYAGE_API_KEY:
+                logger.error("RETRIEVAL_EMBEDDING_BACKEND=voyage but VOYAGE_API_KEY is unset -- retrieval disabled")
+                retrieval_embedder = None
+            else:
+                retrieval_embedder = VoyageEmbedder(
+                    api_key=config.VOYAGE_API_KEY,
+                    model=config.RETRIEVAL_EMBED_MODEL,
+                    dimension=config.RETRIEVAL_EMBED_DIM,
+                )
+        else:
+            from .retrieval.embeddings import OllamaEmbedder
+            retrieval_embedder = OllamaEmbedder(
+                model=config.RETRIEVAL_EMBED_MODEL,
+                dimension=config.RETRIEVAL_EMBED_DIM,
+                host=config.OLLAMA_HOST,
+            )
+
+        if retrieval_embedder is not None:
+            config.RETRIEVAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            retrieval_store = RetrievalStore(config.RETRIEVAL_DB_PATH, embedding_dim=config.RETRIEVAL_EMBED_DIM)
+            retrieval_indexer = RetrievalIndexer(
+                store=retrieval_store, embedder=retrieval_embedder, vault_root=effective_vault_path()
+            )
+            frontmatter_index.add_change_listener(
+                lambda rel_path, exists: (
+                    retrieval_indexer.index_file(rel_path) if exists else retrieval_indexer.delete_file(rel_path)
+                )
+            )
+            logger.info(
+                f"Semantic retrieval enabled: backend={config.RETRIEVAL_EMBEDDING_BACKEND} "
+                f"model={config.RETRIEVAL_EMBED_MODEL} db={config.RETRIEVAL_DB_PATH} "
+                f"(run scripts/reindex_vault.py once to backfill)"
+            )
+    else:
+        logger.info("Semantic retrieval disabled (RETRIEVAL_ENABLED not set) -- vault_search_semantic will report unconfigured")
+
     frontmatter_index.start()
     logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
     yield {"frontmatter_index": frontmatter_index}
     frontmatter_index.stop()
+    if retrieval_store is not None:
+        retrieval_store.close()
     logger.info("Vault MCP server shut down.")
 
 
@@ -84,7 +150,11 @@ from .tools.read import (
     vault_read_section as _vault_read_section,
 )
 from .tools.write import vault_write as _vault_write, vault_append as _vault_append, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
-from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
+from .tools.search import (
+    vault_search as _vault_search,
+    vault_search_frontmatter as _vault_search_frontmatter,
+    vault_search_semantic as _vault_search_semantic,
+)
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
 from .tools.edit import (
     vault_find_replace as _vault_find_replace,
@@ -107,6 +177,7 @@ from .models import (
     VaultBatchFrontmatterUpdateInput,
     VaultSearchInput,
     VaultSearchFrontmatterInput,
+    VaultSearchSemanticInput,
     VaultListInput,
     VaultMoveInput,
     VaultDeleteInput,
@@ -217,6 +288,34 @@ def vault_search_frontmatter(
     """Search by frontmatter fields."""
     inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
     return _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results)
+
+
+@mcp.tool(
+    name="vault_search_semantic",
+    description=(
+        "Meaning-based search over vault content using embeddings -- finds relevant notes "
+        "even when phrased differently than the query. Complements (does not replace) "
+        "vault_search (exact text) and vault_search_frontmatter (structured fields). "
+        "Wrap a phrase in \"double quotes\" to require it verbatim, or -\"phrase\" to exclude it. "
+        "Returns no_good_answer=true with an explicit note when nothing in the vault clears the "
+        "confidence cutoff -- never silently falls back to answering from general knowledge."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+@audited("vault_search_semantic", kind="read")
+def vault_search_semantic(
+    query: str,
+    path_prefix: str | None = None,
+    max_results: int = 10,
+    frontmatter_field: str | None = None,
+    frontmatter_value: str | None = None,
+) -> str:
+    """Meaning-based search over vault content."""
+    inp = VaultSearchSemanticInput(
+        query=query, path_prefix=path_prefix, max_results=max_results,
+        frontmatter_field=frontmatter_field, frontmatter_value=frontmatter_value,
+    )
+    return _vault_search_semantic(inp.query, inp.path_prefix, inp.max_results, inp.frontmatter_field, inp.frontmatter_value)
 
 
 @mcp.tool(

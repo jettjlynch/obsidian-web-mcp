@@ -144,6 +144,7 @@ _MINIMAL_ARGS = {
     "vault_batch_read": {"paths": ["test-note.md"]},
     "vault_search": {"query": "test"},
     "vault_search_frontmatter": {"field": "status", "value": "active"},
+    "vault_search_semantic": {"query": "test"},
     "vault_list": {},
     "vault_read_section": {"path": "test-note.md", "heading": "Nonexistent"},
     "vault_links": {"path": "test-note.md"},

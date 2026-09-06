@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 import frontmatter
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -12,6 +13,10 @@ from watchdog.observers import Observer
 from . import config
 
 logger = logging.getLogger(__name__)
+
+# (relative_path, exists) -- exists=False means the file was deleted (or
+# never existed; the debounced path is stale by the time it's flushed).
+ChangeListener = Callable[[str, bool], None]
 
 
 class FrontmatterIndex:
@@ -23,6 +28,13 @@ class FrontmatterIndex:
         self._observer: Observer | None = None
         self._debounce_timer: threading.Timer | None = None
         self._pending_paths: set[str] = set()
+        # Extension point for RetrievalIndexer (retrieval/indexer.py) and
+        # anything else that needs to react to vault file changes --
+        # RETRIEVAL-DESIGN.md §2.3/§5 step 3 explicitly calls for extending
+        # this existing watcher layer rather than standing up a second
+        # watchdog.Observer on the same vault path (that collision is the
+        # documented 2026-08-03 hang; see test_frontmatter_index_lifecycle.py).
+        self._change_listeners: list[ChangeListener] = []
 
     def start(self) -> None:
         """Walk all .md files, parse frontmatter, and start watching for changes."""
@@ -72,6 +84,14 @@ class FrontmatterIndex:
         _observer directly from outside the class.
         """
         return self._observer is not None
+
+    def add_change_listener(self, listener: ChangeListener) -> None:
+        """Register a callback invoked once per changed file on every
+        debounced flush, as `(relative_path, exists)`. A listener that
+        raises is logged and skipped -- it must never break frontmatter
+        indexing for the rest of the batch or for other listeners.
+        """
+        self._change_listeners.append(listener)
 
     def search_by_field(
         self,
@@ -143,7 +163,8 @@ class FrontmatterIndex:
         for abs_path_str in paths:
             abs_path = Path(abs_path_str)
             rel = str(abs_path.relative_to(config.effective_vault_path()))
-            if abs_path.exists():
+            exists = abs_path.exists()
+            if exists:
                 fm = self._parse_frontmatter(abs_path)
                 with self._lock:
                     if fm is not None:
@@ -153,6 +174,12 @@ class FrontmatterIndex:
             else:
                 with self._lock:
                     self._index.pop(rel, None)
+
+            for listener in self._change_listeners:
+                try:
+                    listener(rel, exists)
+                except Exception:
+                    logger.exception("retrieval change listener failed for %s", rel)
 
 
 class _VaultEventHandler(FileSystemEventHandler):

@@ -94,3 +94,62 @@ FRONTMATTER_INDEX_DEBOUNCE = 5.0
 # Rate limiting (requests per minute) -- track in-memory, enforce per-token
 RATE_LIMIT_READ = 100
 RATE_LIMIT_WRITE = 30
+
+# --- Semantic retrieval (RETRIEVAL-DESIGN.md / PORT-DESIGN.md) --------------
+# Optional feature, OFF by default: main() only wires up the store/embedder/
+# indexer when this is explicitly set. Without it, vault_search_semantic
+# exists on the tool surface but reports itself unconfigured, and the server
+# never touches RETRIEVAL_DB_PATH or makes any embedding calls -- this
+# matters in practice, not just in theory: Ollama is now installed as a real
+# system service on this Mac Mini, so an "always try if reachable" default
+# would make every server start (including test subprocesses) silently
+# write into the real retrieval db and hit a real local model. Opt-in avoids
+# that entirely; explicit is better than a happy accident of what's
+# currently running on the machine.
+RETRIEVAL_ENABLED = os.environ.get("RETRIEVAL_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+# Backend defaults to LOCAL (Ollama), decided 2026-09-06 after the "voyage"
+# backend hit a real 3 RPM rate limit on an un-carded account and Jett chose
+# local/open-source over adding a new paid vendor relationship: zero cost,
+# zero rate limit, runs on the same Mac Mini as everything else here.
+# "voyage" is kept available (already built, tested, proven against the
+# real API) for anyone who'd rather use a hosted model.
+RETRIEVAL_EMBEDDING_BACKEND = os.environ.get("RETRIEVAL_EMBEDDING_BACKEND", "ollama")
+
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")
+
+# Sits outside the vault, same convention as other out-of-vault state: one
+# file to back up, delete-and-rebuild, or point a health-check at. This is
+# the SAME path prouds-mcp's port of this feature uses -- deliberately, so
+# the real index already built there (11,293 files, 297,479 chunks) is
+# picked up here as-is rather than triggering a fresh reindex.
+RETRIEVAL_DB_PATH = Path(
+    os.environ.get("RETRIEVAL_DB_PATH", os.path.expanduser("~/.config/prouds-mcp/retrieval.sqlite"))
+)
+
+# nomic-embed-text (Apache-2.0, retrieval-tuned, ~274MB, CPU-friendly) is the
+# local default -- dimension 768, confirmed live against a real `ollama pull`
+# + `/api/embed` call (2026-09-06). voyage-4-large (dim 1024) is the hosted
+# alternative if RETRIEVAL_EMBEDDING_BACKEND=voyage. A model, dimension, OR
+# backend change is a full-corpus regeneration event (§2.1) -- change
+# deliberately, then run scripts/reindex_vault.py, never silently.
+_EMBED_MODEL_DEFAULTS = {"ollama": "nomic-embed-text", "voyage": "voyage-4-large"}
+_EMBED_DIM_DEFAULTS = {"ollama": 768, "voyage": 1024}
+RETRIEVAL_EMBED_MODEL = os.environ.get(
+    "RETRIEVAL_EMBED_MODEL", _EMBED_MODEL_DEFAULTS.get(RETRIEVAL_EMBEDDING_BACKEND, "nomic-embed-text")
+)
+RETRIEVAL_EMBED_DIM = int(
+    os.environ.get("RETRIEVAL_EMBED_DIM", str(_EMBED_DIM_DEFAULTS.get(RETRIEVAL_EMBEDDING_BACKEND, 768)))
+)
+
+RETRIEVAL_TOP_K = int(os.environ.get("RETRIEVAL_TOP_K", "10"))
+# Raw L2 distance cutoff (sqlite-vec's default vec0 metric) -- §3.3 calls the
+# right threshold model-dependent and tunable, not a fixed universal
+# constant, hence a config knob rather than a hardcoded value. 0.85 is
+# empirically calibrated against nomic-embed-text's real distance
+# distribution on Jett's actual vault (see retrieval/query.py's
+# DEFAULT_MAX_DISTANCE comment for the measurements) -- changing embedding
+# backend/model likely means re-measuring and updating this.
+RETRIEVAL_MAX_DISTANCE = float(os.environ.get("RETRIEVAL_MAX_DISTANCE", "0.85"))
+RETRIEVAL_CHUNK_MAX_TOKENS = int(os.environ.get("RETRIEVAL_CHUNK_MAX_TOKENS", "250"))

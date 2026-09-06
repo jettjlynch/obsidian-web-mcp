@@ -234,6 +234,49 @@ class VaultSearchFrontmatterInput(BaseModel):
     )
 
 
+class VaultSearchSemanticInput(BaseModel):
+    """Meaning-based (embeddings) search across vault content.
+
+    Complements, does not replace, vault_search (exact text) and
+    vault_search_frontmatter (structured fields) -- per RETRIEVAL-DESIGN.md
+    §3.2, callers should reach for whichever tool fits, not expect one
+    "smart" tool to guess.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(
+        ...,
+        description=(
+            'Natural-language question or topic. Wrap a substring in "double quotes" to '
+            'require it verbatim, or prefix with -"phrase" to exclude it.'
+        ),
+        min_length=1,
+        max_length=500,
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Limit search to files under this directory prefix",
+        max_length=500,
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=MAX_SEARCH_RESULTS,
+        description="Maximum number of distinct chunks to return, diversified across source notes",
+    )
+    frontmatter_field: str | None = Field(
+        default=None,
+        description="Optionally narrow to chunks whose frontmatter has this field",
+        max_length=100,
+    )
+    frontmatter_value: str | None = Field(
+        default=None,
+        description="Value to match frontmatter_field against (exact match)",
+        max_length=200,
+    )
+
+
 class VaultBatchReadInput(BaseModel):
     """Read multiple vault files in a single request."""
 

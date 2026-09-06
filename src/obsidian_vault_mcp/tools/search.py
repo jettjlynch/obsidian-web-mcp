@@ -236,3 +236,78 @@ def vault_search_frontmatter(
     except Exception as e:
         logger.error(f"vault_search_frontmatter error: {e}")
         return json.dumps({"error": str(e)})
+
+
+def vault_search_semantic(
+    query: str,
+    path_prefix: str | None = None,
+    max_results: int = 10,
+    frontmatter_field: str | None = None,
+    frontmatter_value: str | None = None,
+) -> str:
+    """Meaning-based search over vault content.
+
+    This server is single-tenant (no per-request identity/scope like
+    prouds-mcp's multi-user model): the process-wide VAULT_SCOPE_ROOT is the
+    only folder-scoping in play, same as vault_search and
+    vault_search_frontmatter above -- so, like them, this passes it straight
+    through into the store's own query-time filter (RETRIEVAL-DESIGN.md
+    §3.1) rather than implementing a second, parallel access check.
+    """
+    from ..retrieval.query import semantic_search
+    from .. import server
+
+    if server.retrieval_store is None or server.retrieval_embedder is None:
+        return json.dumps({"error": "Semantic search is not configured on this server (RETRIEVAL_ENABLED not set)."})
+
+    scope_root = config.VAULT_SCOPE_ROOT
+    effective_prefix = path_prefix
+    if scope_root:
+        effective_prefix = f"{scope_root}/{path_prefix.lstrip('/')}" if path_prefix else scope_root
+
+    try:
+        response = semantic_search(
+            query=query,
+            embedder=server.retrieval_embedder,
+            store=server.retrieval_store,
+            user_scope=effective_prefix or "",
+            top_k=max_results,
+            max_distance=config.RETRIEVAL_MAX_DISTANCE,
+            frontmatter_field=frontmatter_field,
+            frontmatter_value=frontmatter_value,
+        )
+
+        results = []
+        for r in response.results:
+            p = r.file_path
+            if scope_root:
+                if not (p == scope_root or p.startswith(scope_root + "/")):
+                    # Should be unreachable given store-level scoping -- skip
+                    # defensively rather than ever leak a path outside scope.
+                    continue
+                display_path = p[len(scope_root) + 1:] if p != scope_root else p
+            else:
+                display_path = p
+            results.append({
+                "path": display_path,
+                "text": r.text,
+                "heading_path": list(r.heading_path),
+                "line": r.line_start,
+                "distance": r.distance,
+            })
+
+        out = {
+            "results": results,
+            "total": len(results),
+            "no_good_answer": response.no_good_answer,
+            "searched_summary": response.searched_summary,
+        }
+        if response.no_good_answer:
+            out["note"] = (
+                "I didn't find anything in the vault covering this -- this answer "
+                "isn't backed by a note."
+            )
+        return json.dumps(out)
+    except Exception as e:
+        logger.error(f"vault_search_semantic error: {e}")
+        return json.dumps({"error": str(e)})
