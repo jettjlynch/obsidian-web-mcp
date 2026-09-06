@@ -77,6 +77,38 @@ VAULT_OAUTH_STATIC_CLIENT_ID = os.environ.get("VAULT_OAUTH_STATIC_CLIENT_ID", "j
 # session state, not source.
 OAUTH_STATE_DIR = Path(os.environ.get("VAULT_OAUTH_STATE_DIR", str(Path(__file__).resolve().parent.parent.parent)))
 
+# Which client IPs uvicorn trusts to set X-Forwarded-* headers. Because the server
+# derives request.base_url from those headers and advertises it in OAuth discovery
+# metadata + the RFC 9728 WWW-Authenticate challenge, trusting them from arbitrary
+# sources lets an attacker spoof the advertised authorization-server / resource URL
+# (X-Forwarded-Host: evil.example) -- a token-redirection vector. The server binds
+# loopback and is reached by Cloudflare Tunnel / Caddy over localhost, so the only
+# trustworthy forwarder is loopback. Defaults to uvicorn's own default, "127.0.0.1";
+# override only if your reverse proxy connects from a different address (e.g. "::1").
+# Never set this to "*".
+VAULT_MCP_FORWARDED_ALLOW_IPS = os.environ.get("VAULT_MCP_FORWARDED_ALLOW_IPS", "127.0.0.1")
+
+# Canonical public origin for every URL the server advertises -- oauth_metadata's
+# issuer/authorization_endpoint/token_endpoint/registration_endpoint and
+# oauth_protected_resource's resource/authorization_servers (oauth.py). When set
+# (e.g. "https://vault-mcp.wzdmai.com") it PINS those URLs so a spoofed Host /
+# X-Forwarded-Host header cannot redirect OAuth discovery to an attacker-controlled
+# server. When empty, the server falls back to the per-request base_url. A trailing
+# slash is ignored. This server has no WWW-Authenticate challenge (that's a
+# different, not-yet-merged upstream commit, #35) -- this only covers the two
+# metadata endpoints above.
+VAULT_MCP_PUBLIC_URL = os.environ.get("VAULT_MCP_PUBLIC_URL", "").strip()
+
+
+def advertised_base_url(request_base_url: str) -> str:
+    """Return the canonical origin to advertise, with no trailing slash.
+
+    Prefers the operator-pinned VAULT_MCP_PUBLIC_URL; falls back to the request's
+    own base_url. Centralizing this keeps oauth_metadata and
+    oauth_protected_resource (oauth.py) consistent and spoof-resistant.
+    """
+    return (VAULT_MCP_PUBLIC_URL or request_base_url).rstrip("/")
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation

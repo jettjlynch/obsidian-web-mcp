@@ -281,7 +281,7 @@ if config.VAULT_OAUTH_STATIC_CLIENT_ID not in _registered_clients:
 
 async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 OAuth authorization server metadata."""
-    base_url = str(request.base_url).rstrip("/")
+    base_url = config.advertised_base_url(str(request.base_url))
     return JSONResponse({
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/oauth/authorize",
@@ -560,8 +560,19 @@ async def oauth_protected_resource(request: Request) -> JSONResponse:
     reaching a real route. Root-caused 2026-07-14 after a Cloudflare Tunnel
     hostname migration surfaced it as a hard connector failure ("no MCP server
     was found at the provided URL").
+
+    2026-09-06: base_url now goes through config.advertised_base_url() (see
+    that function's docstring) instead of raw request.base_url -- merged in
+    from jimprosser/obsidian-web-mcp's independent fix for the same class of
+    bug (upstream commit 669775a). uvicorn trusted X-Forwarded-Host from ANY
+    client (forwarded_allow_ips="*"), and this endpoint's advertised
+    "resource"/"authorization_servers" URLs were derived straight from that
+    spoofable header -- a caller could steer OAuth discovery toward an
+    attacker-controlled authorization server. Fixed alongside
+    VAULT_MCP_FORWARDED_ALLOW_IPS (now defaults to loopback, not "*") and
+    oauth_metadata's matching use of the same helper, above.
     """
-    base_url = str(request.base_url).rstrip("/")
+    base_url = config.advertised_base_url(str(request.base_url))
     suffix = request.url.path[len("/.well-known/oauth-protected-resource"):]
     return JSONResponse({
         "resource": base_url + suffix,

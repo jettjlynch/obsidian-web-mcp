@@ -566,8 +566,14 @@ def main():
         host="127.0.0.1",
         port=VAULT_MCP_PORT,
         log_level="info",
+        # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
+        # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
+        # caller spoof the advertised OAuth origin via X-Forwarded-Host --
+        # merged in 2026-09-06 from jimprosser/obsidian-web-mcp's independent
+        # fix for the same class of bug (upstream commit 669775a); see
+        # config.VAULT_MCP_FORWARDED_ALLOW_IPS's docstring.
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        forwarded_allow_ips=config.VAULT_MCP_FORWARDED_ALLOW_IPS,
     )
 
 
