@@ -39,6 +39,14 @@ from . import token_scope
 _AUTH_EXEMPT_PATHS = {
     "/health",
     "/.well-known/oauth-authorization-server",
+    # RFC 9728: protected-resource metadata MUST be reachable without a
+    # token -- it's how a client discovers where to authenticate in the
+    # first place. Was missing here despite oauth.py's own
+    # oauth_protected_resource docstring already claiming "must be
+    # publicly reachable (see auth.py's _AUTH_EXEMPT_PATHS)" -- that
+    # claim was wrong until now; found live 2026-09-06 while gathering
+    # before/after evidence for the X-Forwarded-* origin-spoofing fix.
+    "/.well-known/oauth-protected-resource",
     "/oauth/authorize",
     "/oauth/token",
     "/oauth/register",

@@ -1,0 +1,58 @@
+"""Regression test: /.well-known/oauth-protected-resource must not require a
+bearer token.
+
+RFC 9728 protected-resource metadata is how a client discovers where to
+authenticate in the first place -- gating it behind the very auth it's meant
+to bootstrap defeats the point. oauth.py's own oauth_protected_resource
+docstring already claimed "must be reachable without a bearer token (see
+auth.py's _AUTH_EXEMPT_PATHS)", but the path was never actually added there,
+so every real request 401'd. Found live 2026-09-06 while gathering
+before/after evidence for the X-Forwarded-* origin-spoofing fix; fixed here.
+"""
+
+import asyncio
+
+from obsidian_vault_mcp.auth import BearerAuthMiddleware, _AUTH_EXEMPT_PATHS
+
+
+async def _run(path: str, headers: list[tuple[bytes, bytes]]) -> int:
+    async def inner_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    mw = BearerAuthMiddleware(inner_app)
+    scope = {"type": "http", "path": path, "headers": headers}
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    await mw(scope, None, send)
+    return sent[0]["status"]
+
+
+def test_protected_resource_path_is_in_exempt_set():
+    """Direct assertion on the set itself -- the actual bug was a missing
+    entry, not middleware logic, so pin the entry explicitly."""
+    assert "/.well-known/oauth-protected-resource" in _AUTH_EXEMPT_PATHS
+
+
+def test_protected_resource_reachable_with_no_auth_header():
+    status = asyncio.run(_run("/.well-known/oauth-protected-resource", headers=[]))
+    assert status == 200
+
+
+def test_protected_resource_reachable_with_bogus_auth_header():
+    """Exempt means exempt -- a garbage/expired token must not turn this into
+    a 401 either; the path bypasses the token check entirely."""
+    status = asyncio.run(
+        _run("/.well-known/oauth-protected-resource", headers=[(b"authorization", b"Bearer garbage")])
+    )
+    assert status == 200
+
+
+def test_unrelated_path_still_requires_auth():
+    """Sanity check that the exemption is scoped to this one path, not a
+    typo that accidentally opened up the middleware generally."""
+    status = asyncio.run(_run("/mcp", headers=[]))
+    assert status == 401
