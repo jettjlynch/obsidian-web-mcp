@@ -47,6 +47,12 @@ _AUTH_EXEMPT_PATHS = {
     # claim was wrong until now; found live 2026-09-06 while gathering
     # before/after evidence for the X-Forwarded-* origin-spoofing fix.
     "/.well-known/oauth-protected-resource",
+    # oauth.py registers oauth_protected_resource at this second path too
+    # (Route("/.well-known/oauth-protected-resource/mcp", ...) -- same
+    # RFC 9728 handler, same "must be reachable with no token" requirement.
+    # _AUTH_EXEMPT_PATHS is exact-match, not a prefix match, so the base
+    # path's exemption above does NOT cover this one -- needs its own entry.
+    "/.well-known/oauth-protected-resource/mcp",
     "/oauth/authorize",
     "/oauth/token",
     "/oauth/register",

@@ -1,13 +1,20 @@
-"""Regression test: /.well-known/oauth-protected-resource must not require a
-bearer token.
+"""Regression test: both routes serving RFC 9728 protected-resource metadata
+must not require a bearer token.
 
-RFC 9728 protected-resource metadata is how a client discovers where to
-authenticate in the first place -- gating it behind the very auth it's meant
-to bootstrap defeats the point. oauth.py's own oauth_protected_resource
-docstring already claimed "must be reachable without a bearer token (see
-auth.py's _AUTH_EXEMPT_PATHS)", but the path was never actually added there,
-so every real request 401'd. Found live 2026-09-06 while gathering
-before/after evidence for the X-Forwarded-* origin-spoofing fix; fixed here.
+oauth.py registers oauth_protected_resource at TWO paths --
+/.well-known/oauth-protected-resource and .../oauth-protected-resource/mcp --
+and _AUTH_EXEMPT_PATHS is an exact-match set, not a prefix match, so each
+needed its own entry. Protected-resource metadata is how a client discovers
+where to authenticate in the first place -- gating it behind the very auth
+it's meant to bootstrap defeats the point. oauth.py's own
+oauth_protected_resource docstring already claimed "must be reachable without
+a bearer token (see auth.py's _AUTH_EXEMPT_PATHS)", but neither path was
+actually in that set, so every real request to either one 401'd.
+
+Base path found live 2026-09-06 while gathering before/after evidence for the
+X-Forwarded-* origin-spoofing fix; fixed same day. The /mcp-suffixed sibling
+was spotted then too (same handler, same exact-match gap) and fixed as an
+explicit follow-up.
 """
 
 import asyncio
@@ -37,8 +44,19 @@ def test_protected_resource_path_is_in_exempt_set():
     assert "/.well-known/oauth-protected-resource" in _AUTH_EXEMPT_PATHS
 
 
+def test_protected_resource_mcp_path_is_in_exempt_set():
+    """Same handler, different registered path -- exact-match set membership
+    means the base path's entry above does not cover this one."""
+    assert "/.well-known/oauth-protected-resource/mcp" in _AUTH_EXEMPT_PATHS
+
+
 def test_protected_resource_reachable_with_no_auth_header():
     status = asyncio.run(_run("/.well-known/oauth-protected-resource", headers=[]))
+    assert status == 200
+
+
+def test_protected_resource_mcp_reachable_with_no_auth_header():
+    status = asyncio.run(_run("/.well-known/oauth-protected-resource/mcp", headers=[]))
     assert status == 200
 
 
@@ -51,8 +69,15 @@ def test_protected_resource_reachable_with_bogus_auth_header():
     assert status == 200
 
 
+def test_protected_resource_mcp_reachable_with_bogus_auth_header():
+    status = asyncio.run(
+        _run("/.well-known/oauth-protected-resource/mcp", headers=[(b"authorization", b"Bearer garbage")])
+    )
+    assert status == 200
+
+
 def test_unrelated_path_still_requires_auth():
-    """Sanity check that the exemption is scoped to this one path, not a
+    """Sanity check that the exemption is scoped to these two paths, not a
     typo that accidentally opened up the middleware generally."""
     status = asyncio.run(_run("/mcp", headers=[]))
     assert status == 401
