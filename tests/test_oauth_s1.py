@@ -217,7 +217,7 @@ def test_bearer_middleware_rejects_static_token_and_junk_but_accepts_issued(monk
     assert asyncio.run(run(STATIC_TOKEN)) == 401
 
     # Freshly issued per-client token: still accepted.
-    issued = oauth._issue_token("jarvis-app", "read")
+    issued = oauth._issue_token("jarvis-app", "read", audience="vault")
     assert asyncio.run(run(issued)) == 200
 
     # Garbage token: rejected, unchanged.

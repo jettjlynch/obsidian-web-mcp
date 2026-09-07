@@ -345,6 +345,55 @@ def test_pkce_flow_with_checkbox_ticked_issues_write_token(monkeypatch, tmp_path
     assert oauth.get_issued_token_scope(body["access_token"]) == "write"
 
 
+# --- H-2 phone-rollout gap: bridge-scoped token minted alongside the vault
+# one (2026-09-07) -------------------------------------------------------
+
+
+def test_pkce_flow_returns_a_bridge_token_distinct_from_the_vault_token(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    body = _run_pkce_flow(client, tick_write=False)
+    assert "bridge_token" in body
+    assert isinstance(body["bridge_token"], str) and body["bridge_token"]
+    # The actual point of the split (SECURITY.md H-2): these must NOT be the
+    # same value -- "public MCP token != bridge token".
+    assert body["bridge_token"] != body["access_token"]
+
+
+def test_bridge_token_does_not_authenticate_against_the_vault_scope_check(monkeypatch, tmp_path):
+    """A bridge-audience token must not grant access to this server's own
+    MCP tools -- otherwise a leaked bridge_token (a separate, less-trusted
+    surface) would compromise the vault too, defeating the entire point of
+    splitting the two credentials."""
+    client = _client(monkeypatch, tmp_path)
+    body = _run_pkce_flow(client, tick_write=True)  # write, to make a silent pass-through obvious
+    assert oauth.get_issued_token_scope(body["bridge_token"]) is None
+    assert oauth.get_token_scope(body["bridge_token"]) is None
+    # The vault token from the SAME flow still works, for contrast.
+    assert oauth.get_issued_token_scope(body["access_token"]) == "write"
+
+
+def test_issue_token_rejects_invalid_audience_value(monkeypatch, tmp_path):
+    _isolate_oauth_state(monkeypatch, tmp_path)
+    with pytest.raises(ValueError):
+        oauth._issue_token("jarvis-app", "read", audience="bogus")
+
+
+def test_missing_audience_key_treated_as_vault_for_backward_compat(monkeypatch, tmp_path):
+    """Tokens issued before the audience field existed (a real, brief window
+    on 2026-09-07 between H-2's app-bridge-side split and this fix) must
+    keep authenticating as vault tokens -- adding a field isn't a security
+    event worth an unscheduled re-auth, unlike the scope-purge migration."""
+    _isolate_oauth_state(monkeypatch, tmp_path)
+    pre_migration_token = "issued-before-audience-field-existed"
+    oauth._issued_tokens[pre_migration_token] = {
+        "client_id": "jarvis-app",
+        "expires_at": __import__("time").time() + 3600,
+        "scope": "read",
+        # no "audience" key at all
+    }
+    assert oauth.get_issued_token_scope(pre_migration_token) == "read"
+
+
 def test_client_credentials_grant_is_disabled(monkeypatch, tmp_path):
     """2026-09-05, C-2 follow-up: removed outright, not just left alone.
 
@@ -395,8 +444,8 @@ def test_get_token_scope_unknown_token_is_none(monkeypatch, tmp_path):
 
 def test_get_token_scope_returns_issued_tokens_own_scope(monkeypatch, tmp_path):
     _isolate_oauth_state(monkeypatch, tmp_path)
-    read_tok = oauth._issue_token("jarvis-app", "read")
-    write_tok = oauth._issue_token("jarvis-app", "write")
+    read_tok = oauth._issue_token("jarvis-app", "read", audience="vault")
+    write_tok = oauth._issue_token("jarvis-app", "write", audience="vault")
     assert oauth.get_token_scope(read_tok) == "read"
     assert oauth.get_token_scope(write_tok) == "write"
 
@@ -404,7 +453,7 @@ def test_get_token_scope_returns_issued_tokens_own_scope(monkeypatch, tmp_path):
 def test_issue_token_rejects_invalid_scope_value(monkeypatch, tmp_path):
     _isolate_oauth_state(monkeypatch, tmp_path)
     with pytest.raises(ValueError):
-        oauth._issue_token("jarvis-app", "admin")
+        oauth._issue_token("jarvis-app", "admin", audience="vault")
 
 
 # --- Migration: pre-scope tokens are purged, not grandfathered to write ---
@@ -418,7 +467,7 @@ def test_purge_unscoped_tokens_removes_pre_migration_entries(monkeypatch, tmp_pa
         "client_id": "jarvis-app",
         "expires_at": __import__("time").time() + 3600,
     }
-    scoped_token = oauth._issue_token("jarvis-app", "write")
+    scoped_token = oauth._issue_token("jarvis-app", "write", audience="vault")
 
     purged = oauth._purge_unscoped_tokens()
 
@@ -432,5 +481,5 @@ def test_purge_unscoped_tokens_removes_pre_migration_entries(monkeypatch, tmp_pa
 
 def test_purge_unscoped_tokens_is_a_noop_when_already_migrated(monkeypatch, tmp_path):
     _isolate_oauth_state(monkeypatch, tmp_path)
-    oauth._issue_token("jarvis-app", "read")
+    oauth._issue_token("jarvis-app", "read", audience="vault")
     assert oauth._purge_unscoped_tokens() == 0

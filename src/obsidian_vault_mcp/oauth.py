@@ -55,6 +55,25 @@ first use; confirmed nothing legitimate used it first (its docstring on
 oauth_token has the evidence). A real /health route was added the same day
 so mcp_watchdog.sh's automated probe -- previously a hidden consumer of the
 static token itself -- no longer needs any credential at all.
+
+2026-09-07 (H-2's phone-rollout gap, found the day after app-bridge's own
+BRIDGE_TOKEN split): app-bridge (separate process/repo, port 8421) has
+never recognized the vault-audience access_token this endpoint issues --
+neither the legacy static VAULT_MCP_TOKEN nor app-bridge's new BRIDGE_TOKEN
+match it, so jarvis-app's bridge.ts calls have likely 401'd since S1
+(2026-08-30). PLAN.md's S2 spec always called for this endpoint to mint a
+bridge-scoped token as part of the same flow ("the OAuth server mints
+bridge-scoped tokens... public MCP token != bridge token") -- that part
+was simply never built. Fixed: _issue_token gained an explicit `audience`
+("vault"/"bridge"), this endpoint now mints and returns both in one
+response (`access_token` unchanged, new `bridge_token` field), and
+get_issued_token_scope/get_token_scope now only honor "vault"-audience
+entries (a bridge token presented here doesn't authenticate at all,
+preserving "public MCP token != bridge token" even though both live in the
+same _issued_tokens store). App-bridge validates its half via a new,
+side-effect-free token_store.py -- see that module's docstring for why it
+does NOT reuse this file's in-memory _issued_tokens dict directly (a real
+cross-process staleness bug, caught before shipping, not guessed at).
 """
 
 import hashlib
@@ -197,21 +216,38 @@ def _cleanup_tokens() -> None:
         _save_json(_TOKENS_FILE, _issued_tokens)
 
 
-def _issue_token(client_id: str, scope: str) -> str:
-    """`scope` is required, not defaulted -- every call site (there is
-    exactly one, _handle_authorization_code below) must say explicitly what
-    it's granting rather than relying on an implicit default that could
-    silently change meaning later. The default-to-read-unless-approved
-    *policy* lives in oauth_authorize's consent-form handling, not here.
+def _issue_token(client_id: str, scope: str, audience: str) -> str:
+    """`scope` and `audience` are required, not defaulted -- every call site
+    (there are two now, both in _handle_authorization_code below) must say
+    explicitly what it's granting rather than relying on an implicit default
+    that could silently change meaning later. The default-to-read-unless-
+    approved *policy* lives in oauth_authorize's consent-form handling, not
+    here.
+
+    `audience` (2026-09-07, H-2's phone-rollout gap): "vault" for a token
+    meant to authenticate against THIS server's own MCP tools, "bridge" for
+    one meant for app-bridge (a separate process/repo, port 8421). Both live
+    in the SAME _issued_tokens store/file -- the isolation between them is
+    audience-checked at read time (get_issued_token_scope only ever returns
+    a scope for "vault" tokens; app-bridge's token_store.lookup_issued_token
+    is audience-agnostic by design, since only app-bridge calls it and it
+    checks audience=="bridge" itself), not enforced by keeping separate
+    files. This is deliberate: PLAN.md's S2 spec calls for "the OAuth server
+    mints bridge-scoped tokens... a shared verification approach" -- one
+    token format/store, checked fresh by whichever process needs to, rather
+    than two disconnected credential systems.
     """
     if scope not in ("read", "write"):
         raise ValueError(f"invalid token scope: {scope!r}")
+    if audience not in ("vault", "bridge"):
+        raise ValueError(f"invalid token audience: {audience!r}")
     _cleanup_tokens()
     token = secrets.token_urlsafe(32)
     _issued_tokens[token] = {
         "client_id": client_id,
         "expires_at": time.time() + _TOKEN_TTL_SECONDS,
         "scope": scope,
+        "audience": audience,
     }
     _save_json(_TOKENS_FILE, _issued_tokens)
     return token
@@ -227,14 +263,24 @@ def is_valid_issued_token(token: str) -> bool:
 
 
 def get_issued_token_scope(token: str) -> str | None:
-    """Scope of a currently-valid per-client issued token, or None if it's
-    unknown/expired/missing (including a pre-migration entry that somehow
-    survived _purge_unscoped_tokens() -- treated as ungranted, fail closed,
-    rather than assumed).
+    """Scope of a currently-valid per-client issued VAULT-audience token, or
+    None if it's unknown/expired/missing (including a pre-migration entry
+    that somehow survived _purge_unscoped_tokens() -- treated as ungranted,
+    fail closed, rather than assumed) OR a bridge-audience token presented
+    here (2026-09-07 -- see _issue_token's docstring on why both audiences
+    share one store: this is the audience check that keeps a leaked/misused
+    bridge token from also authenticating against this server's own vault
+    MCP tools). A missing "audience" key is treated as "vault" -- entries
+    issued before this field existed predate the split entirely and were
+    always vault-only; no need to invalidate live sessions over adding a
+    field (unlike the scope-purge above, which was invalidating for a real
+    security reason, not just schema hygiene).
     """
     _cleanup_tokens()
     entry = _issued_tokens.get(token)
     if not entry or entry["expires_at"] < time.time():
+        return None
+    if entry.get("audience", "vault") != "vault":
         return None
     return entry.get("scope")
 
@@ -536,16 +582,33 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
     # Scope (C-2, 2026-09-05) is whatever was approved on the consent page --
     # "read" unless the write checkbox was ticked; see oauth_authorize.
     scope = code_data["scope"]
-    access_token = _issue_token(code_data["client_id"], scope)
+    access_token = _issue_token(code_data["client_id"], scope, audience="vault")
+
+    # bridge_token (2026-09-07, H-2's phone-rollout gap): PLAN.md's S2 spec
+    # always called for "the OAuth server mints bridge-scoped tokens" as
+    # part of this same flow -- this was simply never implemented, which is
+    # why the phone's bridge.ts calls have been sending its vault-audience
+    # access_token to app-bridge since S1 (2026-08-30) and getting 401s
+    # (neither the legacy VAULT_MCP_TOKEN nor app-bridge's own BRIDGE_TOKEN
+    # recognize it, by design). Minted in the SAME response as the vault
+    # token -- one PKCE flow, two distinct token values ("public MCP token
+    # != bridge token" per PLAN.md's own constraint), not two separate
+    # browser round trips. `bridge_token` is not part of RFC 6749; jarvis-app's
+    # auth.ts reads it off expo-auth-session's TokenResponse.rawResponse
+    # (see that file's comment for why that's the correct, verified-not-
+    # assumed way to read a non-standard field from that library).
+    bridge_token = _issue_token(code_data["client_id"], scope, audience="bridge")
+
     logger.info(
-        f"OAuth token issued via authorization_code grant "
-        f"(client_id={code_data['client_id']!r}, scope={scope!r})"
+        f"OAuth tokens issued via authorization_code grant "
+        f"(client_id={code_data['client_id']!r}, scope={scope!r}, vault+bridge)"
     )
     return JSONResponse({
         "access_token": access_token,
         "token_type": "bearer",
         "expires_in": _TOKEN_TTL_SECONDS,
         "scope": scope,
+        "bridge_token": bridge_token,
     })
 
 
