@@ -37,69 +37,27 @@ retrieval_indexer = None
 
 @asynccontextmanager
 async def lifespan(server):
-    """Start frontmatter index on server startup, stop on shutdown."""
-    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    """Deliberately does nothing beyond yielding an empty context.
 
-    # Semantic retrieval (RETRIEVAL-DESIGN.md / PORT-DESIGN.md): optional,
-    # additive, OFF unless RETRIEVAL_ENABLED is explicitly set -- absent
-    # that, the tool exists but reports itself unconfigured (see
-    # tools/search.py::vault_search_semantic), and nothing here touches
-    # RETRIEVAL_DB_PATH or makes any embedding calls. Registered as a
-    # frontmatter_index change-listener BEFORE start() so the watcher thread
-    # never has a gap where it's running without one; per §2.3 this keeps
-    # re-indexing incremental on every future change, hooked into the SAME
-    # watcher (extend, don't stand up a second Observer -- see
-    # frontmatter_index.py's ChangeListener docstring for why that matters).
-    global retrieval_store, retrieval_embedder, retrieval_indexer
-    if config.RETRIEVAL_ENABLED:
-        from .retrieval.indexer import RetrievalIndexer
-        from .retrieval.store import RetrievalStore
-
-        if config.RETRIEVAL_EMBEDDING_BACKEND == "voyage":
-            from .retrieval.embeddings import VoyageEmbedder
-            if not config.VOYAGE_API_KEY:
-                logger.error("RETRIEVAL_EMBEDDING_BACKEND=voyage but VOYAGE_API_KEY is unset -- retrieval disabled")
-                retrieval_embedder = None
-            else:
-                retrieval_embedder = VoyageEmbedder(
-                    api_key=config.VOYAGE_API_KEY,
-                    model=config.RETRIEVAL_EMBED_MODEL,
-                    dimension=config.RETRIEVAL_EMBED_DIM,
-                )
-        else:
-            from .retrieval.embeddings import OllamaEmbedder
-            retrieval_embedder = OllamaEmbedder(
-                model=config.RETRIEVAL_EMBED_MODEL,
-                dimension=config.RETRIEVAL_EMBED_DIM,
-                host=config.OLLAMA_HOST,
-            )
-
-        if retrieval_embedder is not None:
-            config.RETRIEVAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            retrieval_store = RetrievalStore(config.RETRIEVAL_DB_PATH, embedding_dim=config.RETRIEVAL_EMBED_DIM)
-            retrieval_indexer = RetrievalIndexer(
-                store=retrieval_store, embedder=retrieval_embedder, vault_root=effective_vault_path()
-            )
-            frontmatter_index.add_change_listener(
-                lambda rel_path, exists: (
-                    retrieval_indexer.index_file(rel_path) if exists else retrieval_indexer.delete_file(rel_path)
-                )
-            )
-            logger.info(
-                f"Semantic retrieval enabled: backend={config.RETRIEVAL_EMBEDDING_BACKEND} "
-                f"model={config.RETRIEVAL_EMBED_MODEL} db={config.RETRIEVAL_DB_PATH} "
-                f"(run scripts/reindex_vault.py once to backfill)"
-            )
-    else:
-        logger.info("Semantic retrieval disabled (RETRIEVAL_ENABLED not set) -- vault_search_semantic will report unconfigured")
-
-    frontmatter_index.start()
-    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
-    yield {"frontmatter_index": frontmatter_index}
-    frontmatter_index.stop()
-    if retrieval_store is not None:
-        retrieval_store.close()
-    logger.info("Vault MCP server shut down.")
+    stateless_http=True means FastMCP's Server.run() re-enters this on EVERY
+    request, not once per process (confirmed 2026-09-06 against the installed
+    mcp SDK -- mcp/server/streamable_http_manager.py's _handle_stateless_request
+    calls self.app.run(...) per request, and mcp/server/lowlevel/server.py's
+    Server.run() enters self.lifespan(self) fresh each time). This used to
+    start/stop frontmatter_index and the retrieval store here, which under
+    that re-entry meant: a full vault re-walk blocking the event loop on every
+    request, a fresh watchdog.Observer racing the previous one on the same
+    path ("... it is already scheduled"), retrieval's change-listener list
+    growing by one on every single request forever, and retrieval_store being
+    closed by one request's teardown while another concurrent request still
+    held a reference to it. frontmatter_index and retrieval are long-lived,
+    server-wide resources with no reason to be tied to a per-request session
+    -- they now start once in main() and stop once there too (see
+    LIFESPAN-INIT-DESIGN.md for the full design and prior-art citations:
+    upstream jimprosser/obsidian-web-mcp#28 and prouds-mcp's b8c199e, both of
+    which hit this same class of bug independently and fixed it the same way).
+    """
+    yield {}
 
 
 async def health(request: Request) -> JSONResponse:
@@ -525,6 +483,69 @@ def main():
             "sign-in until it's set. Already-issued bearer tokens still work."
         )
 
+    # Frontmatter index + semantic retrieval: started ONCE here, at real
+    # process startup, not per-request. See lifespan()'s docstring and
+    # LIFESPAN-INIT-DESIGN.md for why this used to live there and the
+    # concurrency bugs (fsevents "already scheduled" collision, retrieval's
+    # change-listener list growing unbounded, and a close()-under-concurrency
+    # race) that caused, all confirmed 2026-09-06.
+    global retrieval_store, retrieval_embedder, retrieval_indexer
+    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    frontmatter_index.start()
+    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
+
+    # Semantic retrieval (RETRIEVAL-DESIGN.md / PORT-DESIGN.md): optional,
+    # additive, OFF unless RETRIEVAL_ENABLED is explicitly set -- absent
+    # that, the tool exists but reports itself unconfigured (see
+    # tools/search.py::vault_search_semantic), and nothing here touches
+    # RETRIEVAL_DB_PATH or makes any embedding calls. Registered as a
+    # frontmatter_index change-listener AFTER start() -- frontmatter_index.start()
+    # is now synchronous and idempotent (see FrontmatterIndex.start()'s
+    # docstring), so there's no window where the watcher is running without
+    # this listener attached, same guarantee the old per-request ordering was
+    # trying (unsuccessfully) to provide.
+    if config.RETRIEVAL_ENABLED:
+        from .retrieval.indexer import RetrievalIndexer
+        from .retrieval.store import RetrievalStore
+
+        if config.RETRIEVAL_EMBEDDING_BACKEND == "voyage":
+            from .retrieval.embeddings import VoyageEmbedder
+            if not config.VOYAGE_API_KEY:
+                logger.error("RETRIEVAL_EMBEDDING_BACKEND=voyage but VOYAGE_API_KEY is unset -- retrieval disabled")
+                retrieval_embedder = None
+            else:
+                retrieval_embedder = VoyageEmbedder(
+                    api_key=config.VOYAGE_API_KEY,
+                    model=config.RETRIEVAL_EMBED_MODEL,
+                    dimension=config.RETRIEVAL_EMBED_DIM,
+                )
+        else:
+            from .retrieval.embeddings import OllamaEmbedder
+            retrieval_embedder = OllamaEmbedder(
+                model=config.RETRIEVAL_EMBED_MODEL,
+                dimension=config.RETRIEVAL_EMBED_DIM,
+                host=config.OLLAMA_HOST,
+            )
+
+        if retrieval_embedder is not None:
+            config.RETRIEVAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            retrieval_store = RetrievalStore(config.RETRIEVAL_DB_PATH, embedding_dim=config.RETRIEVAL_EMBED_DIM)
+            retrieval_indexer = RetrievalIndexer(
+                store=retrieval_store, embedder=retrieval_embedder, vault_root=effective_vault_path()
+            )
+            frontmatter_index.add_change_listener(
+                lambda rel_path, exists: (
+                    retrieval_indexer.index_file(rel_path) if exists else retrieval_indexer.delete_file(rel_path)
+                )
+            )
+            logger.info(
+                f"Semantic retrieval enabled: backend={config.RETRIEVAL_EMBEDDING_BACKEND} "
+                f"model={config.RETRIEVAL_EMBED_MODEL} db={config.RETRIEVAL_DB_PATH} "
+                f"(run scripts/reindex_vault.py once to backfill)"
+            )
+    else:
+        logger.info("Semantic retrieval disabled (RETRIEVAL_ENABLED not set) -- vault_search_semantic will report unconfigured")
+
     # Build the Starlette app with auth middleware and OAuth endpoints.
     #
     # Deliberately NO try/except-with-unauthenticated-fallback here. This used
@@ -561,20 +582,31 @@ def main():
     # (shared-building ISP, customer.ask4.lan) means strangers' devices.
     # allowed_hosts does NOT protect against that (it only checks the Host
     # header, which any direct caller can forge). Changed 2026-07-14.
-    uvicorn.run(
-        app,
-        host="127.0.0.1",
-        port=VAULT_MCP_PORT,
-        log_level="info",
-        # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
-        # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
-        # caller spoof the advertised OAuth origin via X-Forwarded-Host --
-        # merged in 2026-09-06 from jimprosser/obsidian-web-mcp's independent
-        # fix for the same class of bug (upstream commit 669775a); see
-        # config.VAULT_MCP_FORWARDED_ALLOW_IPS's docstring.
-        proxy_headers=True,
-        forwarded_allow_ips=config.VAULT_MCP_FORWARDED_ALLOW_IPS,
-    )
+    # try/finally, not atexit: guarantees frontmatter_index/retrieval_store
+    # teardown happens exactly when this process's serving loop actually
+    # ends (clean exit or exception), with no dependency on interpreter
+    # shutdown timing -- prouds-mcp's b8c199e pattern, chosen over upstream's
+    # atexit.register() for that reason (see LIFESPAN-INIT-DESIGN.md §4).
+    try:
+        uvicorn.run(
+            app,
+            host="127.0.0.1",
+            port=VAULT_MCP_PORT,
+            log_level="info",
+            # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
+            # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
+            # caller spoof the advertised OAuth origin via X-Forwarded-Host --
+            # merged in 2026-09-06 from jimprosser/obsidian-web-mcp's independent
+            # fix for the same class of bug (upstream commit 669775a); see
+            # config.VAULT_MCP_FORWARDED_ALLOW_IPS's docstring.
+            proxy_headers=True,
+            forwarded_allow_ips=config.VAULT_MCP_FORWARDED_ALLOW_IPS,
+        )
+    finally:
+        frontmatter_index.stop()
+        if retrieval_store is not None:
+            retrieval_store.close()
+        logger.info("Vault MCP server shut down.")
 
 
 if __name__ == "__main__":

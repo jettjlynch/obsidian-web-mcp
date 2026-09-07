@@ -37,7 +37,17 @@ class FrontmatterIndex:
         self._change_listeners: list[ChangeListener] = []
 
     def start(self) -> None:
-        """Walk all .md files, parse frontmatter, and start watching for changes."""
+        """Walk all .md files, parse frontmatter, and start watching for changes.
+
+        Idempotent: a second call while already running is a no-op. The index
+        is built once at process start (server.main), never per request --
+        see LIFESPAN-INIT-DESIGN.md. Defense-in-depth on top of the call-site
+        fix: matches jimprosser/obsidian-web-mcp upstream commit 13e147f's
+        guard, added here for the same reason -- closes the failure mode
+        structurally rather than relying solely on call-site discipline.
+        """
+        if self._observer is not None:
+            return
         t0 = time.monotonic()
         count = 0
 
