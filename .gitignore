@@ -14,3 +14,4 @@ uv.lock
 # session state, not source. See oauth.py.
 oauth_clients.json
 oauth_tokens.json
+oauth_pin_lockout.json

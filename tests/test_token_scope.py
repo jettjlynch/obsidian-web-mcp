@@ -272,7 +272,8 @@ def test_consent_form_write_checkbox_unchecked_by_default(monkeypatch, tmp_path)
         "response_type": "code",
         "client_id": "jarvis-app",
         "redirect_uri": JARVIS_REDIRECT,
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
     })
     assert resp.status_code == 200
     assert 'name="scope" value="write"' in resp.text
@@ -287,7 +288,8 @@ def test_consent_form_prechecks_write_when_client_hints_it(monkeypatch, tmp_path
         "response_type": "code",
         "client_id": "jarvis-app",
         "redirect_uri": JARVIS_REDIRECT,
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
         "scope": "write",
     })
     assert resp.status_code == 200

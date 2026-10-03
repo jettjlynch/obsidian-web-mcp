@@ -28,6 +28,9 @@ def _isolate_oauth_state_files(tmp_path, monkeypatch):
     monkeypatch.setattr(oauth, "_registered_clients", {})
     monkeypatch.setattr(oauth, "_issued_tokens", {})
     monkeypatch.setattr(oauth, "_auth_codes", {})
+    # 2026-10-03: PIN lockout state -- never the real file, fresh counter.
+    monkeypatch.setattr(oauth, "_LOCKOUT_FILE", tmp_path / "oauth_pin_lockout.json")
+    monkeypatch.setattr(oauth, "_pin_lockout", {"failures": 0, "locked_until": 0.0})
     yield
 
 

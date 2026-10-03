@@ -51,6 +51,13 @@ def lookup_issued_token(token: str) -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     entry = data.get(token)
-    if not entry or entry.get("expires_at", 0) < time.time():
+    now = time.time()
+    if not entry or entry.get("expires_at", 0) < now:
+        return None
+    # 2026-10-03: max-age cap. Entries minted since then carry issued_at; a
+    # TTL cut in config applies to them retroactively. Older entries (no
+    # issued_at) fall back to expires_at alone and expire naturally.
+    issued_at = entry.get("issued_at")
+    if issued_at is not None and now - issued_at > config.OAUTH_ACCESS_TOKEN_TTL_SECONDS:
         return None
     return entry

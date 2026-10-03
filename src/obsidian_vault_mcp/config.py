@@ -77,6 +77,14 @@ VAULT_OAUTH_STATIC_CLIENT_ID = os.environ.get("VAULT_OAUTH_STATIC_CLIENT_ID", "j
 # session state, not source.
 OAUTH_STATE_DIR = Path(os.environ.get("VAULT_OAUTH_STATE_DIR", str(Path(__file__).resolve().parent.parent.parent)))
 
+# Access-token lifetime (and max age) for OAuth-issued tokens, both vault and
+# bridge audience. The single source of truth: oauth.py mints with it,
+# token_store.py (app-bridge's read path) enforces max age with it.
+# History: 24h (2026-08-30) -> 30 days (2026-09-18, Jett's call, uncommitted)
+# -> 7 days (2026-10-03, Jett approved hardening). No refresh_token grant, so
+# expiry = PIN re-entry roughly once a week per client.
+OAUTH_ACCESS_TOKEN_TTL_SECONDS = 7 * 86400
+
 # Which client IPs uvicorn trusts to set X-Forwarded-* headers. Because the server
 # derives request.base_url from those headers and advertises it in OAuth discovery
 # metadata + the RFC 9728 WWW-Authenticate challenge, trusting them from arbitrary

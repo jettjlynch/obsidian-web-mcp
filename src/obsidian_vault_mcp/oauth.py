@@ -182,16 +182,136 @@ def _purge_unscoped_tokens() -> int:
 _purge_unscoped_tokens()
 
 # Access-token lifetime for tokens issued by the authorization_code grant.
-# "Real lifetime, not indefinite" per the task spec -- 24h rather than a more
-# aggressive 15-60min SHOULD-tier value from SECURITY.md §5, because
-# jarvis-app's auth.ts has no refresh_token grant: expiry means re-running the
-# full PKCE flow, which now means re-entering the PIN. A short TTL would mean
-# Jett re-entering his PIN multiple times a day on his own phone for a
-# single-user personal app; 24h closes the literal "not indefinite" gap
-# without that daily-use regression. Flagging this trade-off for Jett rather
-# than silently picking a number -- tighten if he wants stronger rotation
-# (S2/H-2 already covers reuse-detection separately).
-_TOKEN_TTL_SECONDS = 86400
+# 24h (2026-08-30) -> 30 days (2026-09-18, Jett's call: no refresh_token
+# grant, so every expiry means re-entering the PIN) -> 7 days (2026-10-03,
+# Jett-approved hardening: a stolen bearer token now lives at most a week,
+# PIN prompt roughly weekly per client). Defined once in config so
+# token_store.py (app-bridge's read path) enforces the same max age.
+# Tokens minted from 2026-10-03 carry `issued_at`, and validation rejects
+# any older than this TTL even if their expires_at says otherwise -- so a
+# future cut here also shortens tokens already in the store. Tokens minted
+# before that have no issued_at and simply run to their stored expires_at.
+_TOKEN_TTL_SECONDS = config.OAUTH_ACCESS_TOKEN_TTL_SECONDS
+
+
+def _token_entry_live(entry: dict | None, now: float | None = None) -> bool:
+    """Is a token-store entry within both its expires_at and (if recorded)
+    the current max age."""
+    if not entry:
+        return False
+    now = time.time() if now is None else now
+    if entry.get("expires_at", 0) < now:
+        return False
+    issued_at = entry.get("issued_at")
+    if issued_at is not None and now - issued_at > _TOKEN_TTL_SECONDS:
+        return False
+    return True
+
+
+# --- PIN brute-force lockout (2026-10-03) -----------------------------------
+#
+# Before this, wrong PINs never locked anything: the PIN is short and
+# /oauth/authorize is on a public, CT-logged hostname, so it was guessable
+# by volume. Now: 5 consecutive wrong PINs -> PIN entry refused for 15
+# minutes (every POST, correct PIN or not -- otherwise the lockout is an
+# oracle). Always temporary: locked_until is clamped to at most 15 minutes
+# ahead on load, and a corrupt state file starts clean rather than locked,
+# so Jett can never be locked out for good. Persisted beside the other
+# OAuth state (0600) so a restart doesn't reset an attacker's counter.
+# Global, not per-IP: behind cloudflared every request arrives from
+# loopback, and there's exactly one human who should ever know the PIN.
+
+_PIN_MAX_FAILURES = 5
+_PIN_LOCKOUT_SECONDS = 15 * 60
+_LOCKOUT_FILE = config.OAUTH_STATE_DIR / "oauth_pin_lockout.json"
+_audit_logger = logging.getLogger("obsidian_vault_mcp.audit")
+
+
+def _load_lockout() -> dict:
+    clean = {"failures": 0, "locked_until": 0.0}
+    try:
+        raw = json.loads(_LOCKOUT_FILE.read_text()) if _LOCKOUT_FILE.exists() else {}
+        failures = int(raw.get("failures", 0))
+        locked_until = float(raw.get("locked_until", 0.0))
+    except Exception:
+        logger.warning("PIN lockout state unreadable/corrupt -- starting clean")
+        return clean
+    # Never permanent: clamp anything beyond one lockout window.
+    locked_until = min(locked_until, time.time() + _PIN_LOCKOUT_SECONDS)
+    return {"failures": max(0, min(failures, _PIN_MAX_FAILURES)), "locked_until": locked_until}
+
+
+def _save_lockout() -> None:
+    try:
+        _save_json(_LOCKOUT_FILE, _pin_lockout)
+    except OSError:
+        logger.warning("Could not persist PIN lockout state (in-memory state still enforced)")
+
+
+_pin_lockout: dict = _load_lockout()
+
+
+def _pin_locked(now: float) -> bool:
+    return _pin_lockout["locked_until"] > now
+
+
+def _record_pin_failure(client_id: str, now: float) -> None:
+    _pin_lockout["failures"] += 1
+    _audit_logger.warning(
+        f"oauth_pin_failure client_id={client_id!r} consecutive={_pin_lockout['failures']}"
+    )
+    if _pin_lockout["failures"] >= _PIN_MAX_FAILURES:
+        _pin_lockout["locked_until"] = now + _PIN_LOCKOUT_SECONDS
+        _pin_lockout["failures"] = 0
+        _audit_logger.warning(
+            f"oauth_pin_lockout client_id={client_id!r} "
+            f"locked_for_seconds={_PIN_LOCKOUT_SECONDS}"
+        )
+    _save_lockout()
+
+
+def _record_pin_success() -> None:
+    if _pin_lockout["failures"] or _pin_lockout["locked_until"]:
+        _pin_lockout["failures"] = 0
+        _pin_lockout["locked_until"] = 0.0
+        _save_lockout()
+
+
+# --- PKCE (required, S256 only -- 2026-10-03) -------------------------------
+#
+# OAuth 2.1 requires PKCE for authorization_code. Before this it was optional
+# here: a request without code_challenge got a code redeemable with no
+# verifier at all. Evidence checked before enforcing: every real
+# /oauth/authorize request in ~/Library/Logs/vault-mcp.log (claude.ai's
+# dynamically registered connectors AND jarvis-app) already sends
+# code_challenge + code_challenge_method=S256.
+
+_PKCE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def _pkce_value_ok(value: str) -> bool:
+    """RFC 7636 §4.1/§4.2: 43-128 unreserved characters."""
+    return isinstance(value, str) and 43 <= len(value) <= 128 and set(value) <= _PKCE_CHARS
+
+
+def _pkce_error(params: dict) -> str | None:
+    if not params.get("code_challenge"):
+        return "code_challenge required (PKCE S256)"
+    if params.get("code_challenge_method") != "S256":
+        return "code_challenge_method must be S256"
+    if not _pkce_value_ok(params["code_challenge"]):
+        return "malformed code_challenge"
+    return None
+
+
+def _authorize_error_redirect(redirect_uri: str, state: str, description: str) -> RedirectResponse:
+    """OAuth 2.1 §4.1.2.1: once redirect_uri is validated, errors go back to
+    the client via redirect, never as a code."""
+    out = {"error": "invalid_request", "error_description": description}
+    if state:
+        out["state"] = state
+    separator = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(url=f"{redirect_uri}{separator}{urlencode(out)}", status_code=302)
 
 
 def _register_client(client_id: str, redirect_uris: list[str], client_name: str = "") -> None:
@@ -209,7 +329,7 @@ def _redirect_uri_allowed(client_id: str, redirect_uri: str) -> bool:
 
 def _cleanup_tokens() -> None:
     now = time.time()
-    expired = [t for t, v in _issued_tokens.items() if v["expires_at"] < now]
+    expired = [t for t, v in _issued_tokens.items() if not _token_entry_live(v, now)]
     if expired:
         for t in expired:
             del _issued_tokens[t]
@@ -243,9 +363,11 @@ def _issue_token(client_id: str, scope: str, audience: str) -> str:
         raise ValueError(f"invalid token audience: {audience!r}")
     _cleanup_tokens()
     token = secrets.token_urlsafe(32)
+    now = time.time()
     _issued_tokens[token] = {
         "client_id": client_id,
-        "expires_at": time.time() + _TOKEN_TTL_SECONDS,
+        "issued_at": now,
+        "expires_at": now + _TOKEN_TTL_SECONDS,
         "scope": scope,
         "audience": audience,
     }
@@ -258,8 +380,7 @@ def is_valid_issued_token(token: str) -> bool:
     static token -- that's a separate check, see get_token_scope). Used by
     tests to confirm a token came from the real per-client issuance path.
     """
-    entry = _issued_tokens.get(token)
-    return bool(entry) and entry["expires_at"] >= time.time()
+    return _token_entry_live(_issued_tokens.get(token))
 
 
 def get_issued_token_scope(token: str) -> str | None:
@@ -278,7 +399,7 @@ def get_issued_token_scope(token: str) -> str | None:
     """
     _cleanup_tokens()
     entry = _issued_tokens.get(token)
-    if not entry or entry["expires_at"] < time.time():
+    if not _token_entry_live(entry):
         return None
     if entry.get("audience", "vault") != "vault":
         return None
@@ -407,7 +528,9 @@ async def oauth_authorize(request: Request):
         "redirect_uri": request.query_params.get("redirect_uri", ""),
         "state": request.query_params.get("state", ""),
         "code_challenge": request.query_params.get("code_challenge", ""),
-        "code_challenge_method": request.query_params.get("code_challenge_method", "S256"),
+        # No default: an absent method means "plain" per RFC 7636, which is
+        # rejected below (2026-10-03, S256 only). Previously defaulted to S256.
+        "code_challenge_method": request.query_params.get("code_challenge_method", ""),
     }
 
     if request.method == "GET":
@@ -427,6 +550,10 @@ async def oauth_authorize(request: Request):
                 {"error": "invalid_request", "error_description": "redirect_uri not registered for this client_id"},
                 status_code=400,
             )
+        pkce_err = _pkce_error(params)
+        if pkce_err:
+            logger.warning(f"OAuth authorize: PKCE rejected ({pkce_err}) -- NOT showing the PIN form")
+            return _authorize_error_redirect(params["redirect_uri"], params["state"], pkce_err)
         # C-2: a client MAY hint scope=write in the query string to pre-check
         # the consent-page box (pure UX -- e.g. so claude.ai's connector
         # doesn't force Jett to hunt for the checkbox every time). This hint
@@ -454,11 +581,31 @@ async def oauth_authorize(request: Request):
             status_code=400,
         )
 
-    if not config.VAULT_OAUTH_AUTHORIZE_PIN or not hmac.compare_digest(pin, config.VAULT_OAUTH_AUTHORIZE_PIN):
+    pkce_err = _pkce_error(params)
+    if pkce_err:
+        logger.warning(f"OAuth authorize: PKCE rejected on POST ({pkce_err}) -- code NOT issued")
+        return _authorize_error_redirect(params["redirect_uri"], params["state"], pkce_err)
+
+    # PIN lockout (2026-10-03): checked before the PIN is even compared, so a
+    # correct PIN during lockout gets the same generic answer as a wrong one.
+    now = time.time()
+    if _pin_locked(now):
+        logger.warning("OAuth authorize: PIN entry temporarily locked -- code NOT issued")
+        return HTMLResponse(
+            _consent_form_html(params, error="Unable to verify right now. Try again later.",
+                               requested_scope=scope),
+            status_code=429,
+        )
+
+    if not config.VAULT_OAUTH_AUTHORIZE_PIN or not hmac.compare_digest(
+        pin.encode("utf-8"), config.VAULT_OAUTH_AUTHORIZE_PIN.encode("utf-8")
+    ):
         logger.warning("OAuth authorize: incorrect or missing PIN -- code NOT issued")
+        _record_pin_failure(params["client_id"], now)
         return HTMLResponse(
             _consent_form_html(params, error="Incorrect PIN.", requested_scope=scope), status_code=401
         )
+    _record_pin_success()
 
     response_type = params["response_type"]
     redirect_uri = params["redirect_uri"]
@@ -562,18 +709,23 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
     if redirect_uri and code_data["redirect_uri"] and redirect_uri != code_data["redirect_uri"]:
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
-    # Verify PKCE code_challenge if one was provided during authorization
-    if code_data["code_challenge"]:
-        if not code_verifier:
-            return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier required"}, status_code=400)
+    # PKCE S256 is REQUIRED (2026-10-03): /oauth/authorize no longer issues a
+    # code without an S256 challenge, and a code is never redeemable without
+    # a matching verifier. Previously skipped entirely when no challenge.
+    if not code_data.get("code_challenge") or code_data.get("code_challenge_method") != "S256":
+        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE required"}, status_code=400)
+    if not code_verifier:
+        return JSONResponse({"error": "invalid_grant", "error_description": "code_verifier required"}, status_code=400)
+    if not _pkce_value_ok(code_verifier):
+        return JSONResponse({"error": "invalid_grant", "error_description": "malformed code_verifier"}, status_code=400)
 
-        # S256: BASE64URL(SHA256(code_verifier)) must match code_challenge
-        import base64
-        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-        computed_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    # S256: BASE64URL(SHA256(code_verifier)) must match code_challenge
+    import base64
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    computed_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
-        if not hmac.compare_digest(computed_challenge, code_data["code_challenge"]):
-            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+    if not hmac.compare_digest(computed_challenge, code_data["code_challenge"]):
+        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
     # Per-client random token (S1, 2026-08-30) -- never the shared static
     # VAULT_MCP_TOKEN. auth.py's bearer middleware accepts this alongside the

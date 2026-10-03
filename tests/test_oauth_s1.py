@@ -65,7 +65,8 @@ def test_authorize_get_rejects_unregistered_redirect_uri(monkeypatch, tmp_path):
         "response_type": "code",
         "client_id": "jarvis-app",
         "redirect_uri": "https://attacker.example.com/steal",
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
     })
     assert resp.status_code == 400
     assert "PIN" not in resp.text  # never shown the consent form
@@ -77,7 +78,8 @@ def test_authorize_get_rejects_unregistered_client_id(monkeypatch, tmp_path):
         "response_type": "code",
         "client_id": "not-a-real-client",
         "redirect_uri": JARVIS_REDIRECT,
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
     })
     assert resp.status_code == 400
 
@@ -90,7 +92,8 @@ def test_authorize_post_rejects_bad_redirect_uri_even_with_correct_pin(monkeypat
         "response_type": "code",
         "client_id": "jarvis-app",
         "redirect_uri": "https://attacker.example.com/steal",
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
         "pin": PIN,
     })
     assert resp.status_code == 400
@@ -103,7 +106,8 @@ def test_authorize_get_with_valid_jarvis_app_request_shows_pin_form(monkeypatch,
         "response_type": "code",
         "client_id": "jarvis-app",
         "redirect_uri": JARVIS_REDIRECT,
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
     })
     assert resp.status_code == 200
     assert "PIN" in resp.text
@@ -159,7 +163,8 @@ def test_dynamically_registered_client_gets_its_own_redirect_uri_checked(monkeyp
         "response_type": "code",
         "client_id": reg["client_id"],
         "redirect_uri": "https://claude.ai/api/mcp/callback",
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
     })
     assert ok.status_code == 200
 
@@ -169,7 +174,8 @@ def test_dynamically_registered_client_gets_its_own_redirect_uri_checked(monkeyp
         "response_type": "code",
         "client_id": reg["client_id"],
         "redirect_uri": JARVIS_REDIRECT,
-        "code_challenge": "x",
+        "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "code_challenge_method": "S256",
     })
     assert cross.status_code == 400
 
