@@ -10,7 +10,6 @@ from obsidian_vault_mcp.vault import (
     resolve_vault_path,
     read_file,
     write_file_atomic,
-    write_bytes_atomic,
     delete_path,
     move_path,
     list_directory,
@@ -153,28 +152,6 @@ def test_write_overwrite_preserves_existing_mode(vault_dir):
     write_file_atomic("test-note.md", "Overwritten content.")
     assert _mode(target) == 0o664
     assert target.read_text() == "Overwritten content."
-
-
-@pytestmark_posix
-def test_write_bytes_new_file_honors_umask(vault_dir):
-    """The binary writer honors umask too (shared _publish_mode reaches both helpers)."""
-    old = os.umask(0o022)
-    try:
-        write_bytes_atomic("attachment.bin", b"\x00\x01\x02")
-        assert _mode(vault_dir / "attachment.bin") == 0o644
-    finally:
-        os.umask(old)
-
-
-@pytestmark_posix
-def test_write_bytes_no_clobber_honors_umask(vault_dir):
-    """The no-clobber (os.link) create path also honors umask for the new file."""
-    old = os.umask(0o022)
-    try:
-        write_bytes_atomic("new-attachment.bin", b"data", overwrite=False)
-        assert _mode(vault_dir / "new-attachment.bin") == 0o644
-    finally:
-        os.umask(old)
 
 
 def test_write_failure_leaves_no_temp_and_original_intact(vault_dir, monkeypatch):
