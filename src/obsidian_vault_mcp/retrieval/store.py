@@ -14,14 +14,33 @@ this sqlite-vec version: a `chunk_id IN (subquery)` predicate combined with
 it does not filter an already-computed unrestricted top-k afterward.
 """
 
+import functools
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import sqlite_vec
 
 from .chunker import Chunk
+
+
+def _locked(method):
+    """Serialize every use of the shared connection through self._lock.
+
+    The connection is opened with check_same_thread=False (see __init__), so
+    sqlite3 no longer polices thread affinity; this lock is what makes that
+    safe. RLock because apply() calls existing_hashes() and diff() calls
+    existing_hashes() while already holding it.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -52,12 +71,22 @@ def _scope_predicate(prefix: str) -> tuple[str, tuple]:
 class RetrievalStore:
     def __init__(self, db_path: str | Path, embedding_dim: int):
         self.embedding_dim = embedding_dim
-        self._conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False + self._lock (2026-10-03 fix): server.py
+        # creates this store on the main thread, but the retrieval change
+        # listener runs on frontmatter_index's threading.Timer thread and
+        # sync tools can run on a worker thread. The sqlite3 default
+        # (check_same_thread=True) made every listener call raise
+        # ProgrammingError -- 9,044 times in vault-mcp-error.log -- so edited
+        # notes were never re-indexed. One shared connection, all access
+        # serialized by an RLock (see _locked), keeps writes ordered.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.enable_load_extension(True)
         sqlite_vec.load(self._conn)
         self._conn.enable_load_extension(False)
         self._init_schema()
 
+    @_locked
     def close(self) -> None:
         self._conn.close()
 
@@ -89,12 +118,14 @@ class RetrievalStore:
 
     # -- incremental re-indexing (§2.3) -----------------------------------
 
+    @_locked
     def existing_hashes(self, file_path: str) -> set[str]:
         rows = self._conn.execute(
             "SELECT content_hash FROM chunks WHERE file_path = ?", (file_path,)
         ).fetchall()
         return {r[0] for r in rows}
 
+    @_locked
     def diff(self, file_path: str, chunks: list[Chunk]) -> tuple[list[Chunk], list[Chunk]]:
         """Split `chunks` (the freshly re-chunked current content of a file)
         into (needs_embedding, already_stored) by comparing content hashes
@@ -105,6 +136,7 @@ class RetrievalStore:
         reused = [c for c in chunks if c.content_hash in existing]
         return to_embed, reused
 
+    @_locked
     def apply(
         self,
         file_path: str,
@@ -203,6 +235,7 @@ class RetrievalStore:
 
         self._conn.commit()
 
+    @_locked
     def delete_file(self, file_path: str) -> None:
         ids = self._conn.execute("SELECT id FROM chunks WHERE file_path = ?", (file_path,)).fetchall()
         for (row_id,) in ids:
@@ -212,6 +245,7 @@ class RetrievalStore:
 
     # -- query path (§3) ---------------------------------------------------
 
+    @_locked
     def query(
         self,
         query_vector: list[float],
