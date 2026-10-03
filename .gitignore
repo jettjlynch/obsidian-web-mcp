@@ -6,7 +6,11 @@ dist/
 wheels/
 *.egg-info
 .venv/
+# Any env file or env backup (.env, .env.bak, .env.local, ...) holds live secrets.
+# 2026-10-03: .env.bak was untracked but NOT ignored in this PUBLIC repo.
 .env
+.env*
+!.env.example
 uv.lock
 .claude-flow/
 
