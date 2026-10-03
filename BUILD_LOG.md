@@ -24,6 +24,18 @@ Derived from module docstrings under `src/obsidian_vault_mcp/` and `scripts/` (2
 
 ---
 
+## 2026-10-03 — Found uncommitted oauth.py change (unlogged)
+
+**What:** `src/obsidian_vault_mcp/oauth.py` has one uncommitted change (file mtime 2026-09-18 09:13): `_TOKEN_TTL_SECONDS` raised from `86400` (24h) to `30 * 86400` (30 days) for access tokens issued by the authorization_code grant, with the comment rewritten to say "Extended 2026-09-18 (Jett's explicit call)". Nothing else in the file changed (11+/10-, all in that comment + constant). Last commit touching the file is `5010273` (2026-09-07, H-2).
+**Why:** Unknown first-hand — found in the 2026-10-03 audit. The code comment says Jett chose it because there is no refresh_token grant (jarvis-app `auth.ts` and the claude.ai connector only do authorization_code), so 24h expiry meant re-entering the PIN every ~24-36h. The 2026-09-18 security audit (vault `Daily/2026-09-18.md`) already listed "live uncommitted TTL 24h→30d" as a finding, so it was known but never logged here or committed.
+**Is it live?** YES. `com.jettlynch.vault-mcp` runs `run-vault-mcp.sh` -> `uv run --project ~/code/obsidian-web-mcp vault-mcp`; the venv has an editable install (`_editable_impl_obsidian_web_mcp.pth` -> `~/code/obsidian-web-mcp/src`), and the running process (PID 1060) started 2026-10-03 10:13, after the edit. So the deployed server issues 30-day tokens from this uncommitted code. app-bridge also imports `obsidian_vault_mcp` from this same `src/` (token lookup).
+**Security assessment: CONCERN (deliberate loosening, not a regression bug).** It weakens auth in one way: any stolen/leaked bearer token (vault and bridge-scoped) now stays valid up to 30 days instead of 24h, with no refresh-token rotation. It does NOT touch PKCE, PIN check, scope enforcement, the unscoped-token purge, or H-2 reuse detection. Still open from the 09-18 audit and made more relevant by the longer TTL: PKCE optional, no PIN lockout (brute force), no user-facing token revocation. Options for Jett: (a) accept and commit it as a documented decision; (b) add a refresh_token grant and go back to a short TTL; (c) middle ground 7 days.
+**Files touched:** this log entry only. Code NOT committed, NOT reverted.
+**Rollback:** `git checkout -- src/obsidian_vault_mcp/oauth.py` would discard the change and go back to 24h (then `launchctl kickstart -k gui/$UID/com.jettlynch.vault-mcp`) — NOT done; it is Jett's call. Removing this entry: delete this section.
+**Verified:** git diff read in full; plist, launcher script, venv .pth and process start time read (read-only). **NOT verified:** that already-issued tokens carry a 30-day `expires_at` in the token store (store not read, it holds secrets); whether Jett still wants 30 days.
+
+---
+
 ## 2026-10-03: BUILD_LOG.md created (RECONSTRUCTED from git history 2026-10-03, Why/Verified may be incomplete)
 
 **What:** File did not exist (OPERATIONS.md served as the ops log). Created by the all-builds log audit (`~/work/Scripts/BUILD_LOG.md`). Entries below grouped from 20 commits (2026-03-17 to 2026-09-07).
