@@ -161,3 +161,23 @@ def extract_tags(metadata: dict | None, body: str) -> list[str]:
         found.add(m.group(1))
 
     return sorted(found)
+
+
+def json_safe(value):
+    """Return frontmatter data with YAML-only scalars turned into JSON-native ones.
+
+    PyYAML (python-frontmatter) parses unquoted ``2026-10-04`` as ``datetime.date``
+    and ``2026-10-04 10:30`` as ``datetime.datetime``; ``json.dumps`` cannot encode
+    either, which broke vault_search / vault_read / vault_batch_read for any note
+    with such a date (fixed 2026-10-04). Dates become ISO strings (what Obsidian
+    shows); dicts/lists/tuples recurse; every other value is returned unchanged.
+    """
+    import datetime as _dt
+
+    if isinstance(value, (_dt.date, _dt.time)):  # datetime is a date subclass
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k) if isinstance(k, (_dt.date, _dt.time)) else k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value

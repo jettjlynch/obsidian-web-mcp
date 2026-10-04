@@ -90,3 +90,16 @@ def vault_dir(tmp_path, monkeypatch):
     config.VAULT_PATH = Path(str(vault))
 
     yield vault
+
+
+@pytest.fixture(autouse=True)
+def _isolate_datalayer_flag(monkeypatch):
+    """Data-layer hook OFF unless a test turns it on itself.
+
+    Found 2026-10-04 (data-research): with the real flags.json at vault_mcp=true,
+    every read in test_tools/test_vault etc. ran log_recall() against the LIVE
+    recall log -- 70 of its 72 lines were fixture paths (test-note.md, nested.md,
+    batch-0.md ...). test_datalayer.py sets the env per test, which wins over this.
+    """
+    monkeypatch.setenv("DATALAYER_RERANK_VAULT_MCP", "0")
+    yield

@@ -5,8 +5,8 @@ import logging
 
 import frontmatter
 
-from .. import config
-from ..markdown import find_heading_section
+from .. import config, datalayer
+from ..markdown import find_heading_section, json_safe
 from ..vault import resolve_vault_path, read_file
 
 logger = logging.getLogger(__name__)
@@ -55,10 +55,11 @@ def vault_read(path: str) -> str:
         try:
             post = frontmatter.loads(content)
             if post.metadata:
-                fm_data = post.metadata
+                fm_data = json_safe(post.metadata)
         except Exception:
             pass
 
+        datalayer.log_recall([path])  # no-op unless the data-layer vault_mcp flag is on
         return json.dumps({
             "path": path,
             "content": content,
@@ -93,7 +94,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             try:
                 post = frontmatter.loads(content)
                 if post.metadata:
-                    fm_data = post.metadata
+                    fm_data = json_safe(post.metadata)
             except Exception:
                 pass
 
@@ -114,4 +115,6 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             results.append({"path": path, "error": str(e)})
             missing += 1
 
+    if include_content:  # data-layer recall log; no-op unless its vault_mcp flag is on
+        datalayer.log_recall([r["path"] for r in results if "error" not in r])
     return json.dumps({"files": results, "found": found, "missing": missing, "truncated": truncated})
