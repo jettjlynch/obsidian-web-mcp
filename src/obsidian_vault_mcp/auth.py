@@ -33,7 +33,7 @@ import json
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .oauth import get_token_scope
-from . import token_scope
+from . import config, token_scope
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -59,7 +59,43 @@ _AUTH_EXEMPT_PATHS = {
 }
 
 
-async def _send_json(send: Send, status_code: int, payload: dict) -> None:
+def _www_authenticate(scope: Scope, error: str) -> bytes:
+    """RFC 9728 Bearer challenge pointing clients at protected-resource metadata.
+
+    Port of upstream 60d7a13 (#35) into this fork's pure-ASGI middleware.
+    Without it a 401 is just a failed request; with it a spec-compliant MCP
+    client (Claude Code, ChatGPT, claude.ai) knows to fetch the metadata and
+    start the OAuth flow ("Needs authentication" rather than "Failed to
+    connect"). The origin goes through config.advertised_base_url, the same
+    spoof-resistant helper oauth_metadata / oauth_protected_resource use
+    (VAULT_MCP_PUBLIC_URL when pinned, else the request's own origin). The
+    metadata path mirrors the routes oauth.py serves: /mcp requests point at
+    .../oauth-protected-resource/mcp, everything else at the base path.
+    """
+    host = ""
+    for name, value in scope.get("headers", []):
+        if name == b"host":
+            host = value.decode("latin-1")
+            break
+    if not host:
+        server = scope.get("server") or ("localhost", None)
+        host = server[0] if server[1] in (None, 80, 443) else f"{server[0]}:{server[1]}"
+    request_base = f"{scope.get('scheme', 'http')}://{host}{scope.get('root_path', '')}"
+    base_url = config.advertised_base_url(request_base)
+    path = scope.get("path", "")
+    suffix = "/mcp" if path == "/mcp" or path.startswith("/mcp/") else ""
+    resource_metadata = f"{base_url}/.well-known/oauth-protected-resource{suffix}"
+    # Never let a quote/backslash from a client-supplied Host break out of
+    # the quoted-string parameter.
+    resource_metadata = resource_metadata.replace('"', "").replace("\\", "")
+    return (
+        f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
+    ).encode("latin-1", errors="replace")
+
+
+async def _send_json(
+    send: Send, status_code: int, payload: dict, extra_headers: list[tuple[bytes, bytes]] | None = None
+) -> None:
     """Emit a minimal JSON response over raw ASGI (no Starlette Response)."""
     body = json.dumps(payload).encode("utf-8")
     await send(
@@ -69,7 +105,8 @@ async def _send_json(send: Send, status_code: int, payload: dict) -> None:
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode("latin-1")),
-            ],
+            ]
+            + (extra_headers or []),
         }
     )
     await send({"type": "http.response.body", "body": body})
@@ -102,7 +139,10 @@ class BearerAuthMiddleware:
                 break
 
         if not auth_header.startswith("Bearer "):
-            await _send_json(send, 401, {"error": "Missing or malformed Authorization header"})
+            await _send_json(
+                send, 401, {"error": "Missing or malformed Authorization header"},
+                [(b"www-authenticate", _www_authenticate(scope, "invalid_request"))],
+            )
             return
 
         token = auth_header[7:]
@@ -113,7 +153,10 @@ class BearerAuthMiddleware:
         # None means the token is unknown/expired -- invalid.
         granted_scope = get_token_scope(token)
         if granted_scope is None:
-            await _send_json(send, 401, {"error": "Invalid token"})
+            await _send_json(
+                send, 401, {"error": "Invalid token"},
+                [(b"www-authenticate", _www_authenticate(scope, "invalid_token"))],
+            )
             return
 
         # Thread the granted scope down to audit.py's tool-wrapper gate for
