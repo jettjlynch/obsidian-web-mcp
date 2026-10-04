@@ -81,10 +81,13 @@ import hmac
 import html as _html
 import json
 import logging
+import math
 import os
 import secrets
 import stat
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
 
@@ -138,8 +141,85 @@ def _load_json(path: Path) -> dict:
 
 
 def _save_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600, matches jjvault/.env convention
+    """Persist OAuth state atomically, owner-only from the first byte.
+
+    Ported 2026-10-04 from upstream e975be2 (#41) + 4fa12c1 (#87). Before,
+    path.write_text() created the file with the umask's mode (0644 here) and
+    only chmod'ed it afterwards, so live bearer tokens were briefly
+    world-readable; and a crash mid-write left a truncated file, which
+    _load_json treats as corrupt -> empty, i.e. every issued token and
+    registered client silently lost on the next restart. Now: tmp file
+    created 0600 via os.open, fchmod (guarded, belt-and-braces for a stale
+    wider tmp), fsync, os.replace (atomic on POSIX). The final file keeps
+    0600 (os.replace carries the tmp's mode).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0600, matches jjvault/.env convention
+        with os.fdopen(fd, "w") as f:
+            fd = -1
+            f.write(json.dumps(data, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd != -1:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+# --- Brake on /oauth/register (2026-10-04, port of upstream 5bdba5b / #97) ----
+#
+# /oauth/register is unauthenticated and every registration is persisted to
+# oauth_clients.json, so without a cap anyone could grow that file (and the
+# in-memory registry) without bound. Global, not per-IP (behind cloudflared
+# every request arrives from loopback). 20/hour is far above real use (a
+# connector registers once when it is added). A refused registration saves
+# nothing. The other half of upstream's #97, the failed-login brake, is
+# already covered here by the PIN lockout (5 wrong PINs -> 15 min).
+REGISTRATION_LIMIT = 20
+REGISTRATION_WINDOW_SECONDS = 60 * 60
+
+_clock = time.monotonic  # tests move time through this
+
+
+class _SlidingLimit:
+    """At most ``limit`` events in any ``window`` seconds, across all callers."""
+
+    def __init__(self, limit: int, window: float):
+        self.limit = limit
+        self.window = window
+        self._events: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        while self._events and self._events[0] <= now - self.window:
+            self._events.popleft()
+
+    def retry_after(self) -> int:
+        """Seconds until the next event is allowed; 0 when it is allowed now."""
+        with self._lock:
+            now = _clock()
+            self._prune(now)
+            if len(self._events) < self.limit:
+                return 0
+            return max(1, math.ceil(self._events[0] + self.window - now))
+
+    def record(self) -> None:
+        with self._lock:
+            now = _clock()
+            self._prune(now)
+            self._events.append(now)
+
+
+_registrations = _SlidingLimit(REGISTRATION_LIMIT, REGISTRATION_WINDOW_SECONDS)
 
 
 _registered_clients: dict[str, dict] = _load_json(_CLIENTS_FILE)
@@ -673,6 +753,9 @@ async def oauth_token(request: Request) -> JSONResponse:
     if grant_type == "authorization_code":
         client_id = form.get("client_id", "")
         client_secret = form.get("client_secret", "")
+        if not client_id:
+            # client_secret_basic: client_id in the HTTP Basic header.
+            client_id = _basic_auth_client_id(request.headers.get("authorization", ""))
         return await _handle_authorization_code(form, client_id, client_secret)
     elif grant_type == "client_credentials":
         return JSONResponse(
@@ -692,6 +775,19 @@ async def oauth_token(request: Request) -> JSONResponse:
         )
 
 
+def _basic_auth_client_id(header: str) -> str:
+    """client_id from an RFC 6749 2.3.1 HTTP Basic header, or "" if absent/bad."""
+    if not header.lower().startswith("basic "):
+        return ""
+    import base64
+    from urllib.parse import unquote_plus
+    try:
+        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+    except Exception:
+        return ""
+    return unquote_plus(decoded.split(":", 1)[0])
+
+
 async def _handle_authorization_code(form, client_id: str, client_secret: str) -> JSONResponse:
     """Exchange an authorization code for a bearer token."""
     code = form.get("code", "")
@@ -703,10 +799,19 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
     if code not in _auth_codes:
         return JSONResponse({"error": "invalid_grant", "error_description": "Invalid or expired code"}, status_code=400)
 
-    code_data = _auth_codes.pop(code)
+    code_data = _auth_codes.pop(code)  # single-use
 
-    # Verify redirect_uri matches
-    if redirect_uri and code_data["redirect_uri"] and redirect_uri != code_data["redirect_uri"]:
+    # RFC 6749 4.1.3: the code must be redeemed by the client it was issued
+    # to, and redirect_uri must be present and identical to the one bound to
+    # the code. Before 2026-10-04 (port of upstream c385d41 #4b / e4924f0)
+    # an omitted redirect_uri skipped the check and client_id was never
+    # compared. PKCE already binds the code to the verifier holder; this is
+    # the spec's second binding, defense in depth.
+    if not client_id or not hmac.compare_digest(
+        client_id.encode("utf-8"), (code_data.get("client_id") or "").encode("utf-8")
+    ):
+        return JSONResponse({"error": "invalid_grant", "error_description": "client_id mismatch"}, status_code=400)
+    if not redirect_uri or redirect_uri != code_data["redirect_uri"]:
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
     # PKCE S256 is REQUIRED (2026-10-03): /oauth/authorize no longer issues a
@@ -815,6 +920,16 @@ async def oauth_register(request: Request) -> JSONResponse:
     real config.VAULT_OAUTH_CLIENT_SECRET, known only to whoever configured it
     out-of-band) -- it exists only because the DCR response shape requires the field.
     """
+    wait = _registrations.retry_after()
+    if wait:
+        logger.warning(f"OAuth registration refused: limit reached, {wait}s until the next.")
+        return JSONResponse(
+            {"error": "too_many_requests",
+             "error_description": "Too many client registrations; try again later."},
+            status_code=429,
+            headers={"Retry-After": str(wait)},
+        )
+
     try:
         body = await request.json()
     except Exception:
@@ -832,6 +947,7 @@ async def oauth_register(request: Request) -> JSONResponse:
     # closes the open-redirect half of C-1/M-1 for dynamically-registered
     # clients (e.g. claude.ai's MCP connector) the same way the pre-registered
     # static entry closes it for jarvis-app, which never calls this endpoint.
+    _registrations.record()
     _register_client(client_id, redirect_uris, client_name)
 
     return JSONResponse({

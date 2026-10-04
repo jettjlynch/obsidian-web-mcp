@@ -31,6 +31,11 @@ def _isolate_oauth_state_files(tmp_path, monkeypatch):
     # 2026-10-03: PIN lockout state -- never the real file, fresh counter.
     monkeypatch.setattr(oauth, "_LOCKOUT_FILE", tmp_path / "oauth_pin_lockout.json")
     monkeypatch.setattr(oauth, "_pin_lockout", {"failures": 0, "locked_until": 0.0})
+    # 2026-10-04: /oauth/register brake is module-global; fresh per test.
+    monkeypatch.setattr(
+        oauth, "_registrations",
+        oauth._SlidingLimit(oauth.REGISTRATION_LIMIT, oauth.REGISTRATION_WINDOW_SECONDS),
+    )
     yield
 
 

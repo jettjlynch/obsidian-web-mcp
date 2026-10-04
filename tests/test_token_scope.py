@@ -325,6 +325,7 @@ def _run_pkce_flow(client, *, tick_write: bool):
 
     token_resp = client.post("/oauth/token", data={
         "grant_type": "authorization_code",
+        "client_id": "jarvis-app",
         "code": code,
         "redirect_uri": JARVIS_REDIRECT,
         "code_verifier": verifier,

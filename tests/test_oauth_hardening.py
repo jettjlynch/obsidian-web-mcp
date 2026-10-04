@@ -159,7 +159,7 @@ def test_token_requires_code_verifier(client):
     authz = client.post("/oauth/authorize", data={**_authz_params(challenge), "pin": PIN})
     code = authz.headers["location"].split("code=")[1].split("&")[0]
     resp = client.post("/oauth/token", data={
-        "grant_type": "authorization_code", "code": code, "redirect_uri": JARVIS_REDIRECT,
+        "grant_type": "authorization_code", "code": code, "client_id": "jarvis-app", "redirect_uri": JARVIS_REDIRECT,
     })
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_grant"
@@ -170,7 +170,7 @@ def test_token_rejects_wrong_verifier(client):
     authz = client.post("/oauth/authorize", data={**_authz_params(challenge), "pin": PIN})
     code = authz.headers["location"].split("code=")[1].split("&")[0]
     resp = client.post("/oauth/token", data={
-        "grant_type": "authorization_code", "code": code, "redirect_uri": JARVIS_REDIRECT,
+        "grant_type": "authorization_code", "code": code, "client_id": "jarvis-app", "redirect_uri": JARVIS_REDIRECT,
         "code_verifier": secrets.token_urlsafe(32),
     })
     assert resp.status_code == 400
@@ -181,7 +181,7 @@ def test_token_rejects_non_ascii_verifier_without_500(client):
     authz = client.post("/oauth/authorize", data={**_authz_params(challenge), "pin": PIN})
     code = authz.headers["location"].split("code=")[1].split("&")[0]
     resp = client.post("/oauth/token", data={
-        "grant_type": "authorization_code", "code": code, "redirect_uri": JARVIS_REDIRECT,
+        "grant_type": "authorization_code", "code": code, "client_id": "jarvis-app", "redirect_uri": JARVIS_REDIRECT,
         "code_verifier": "é" * 50,
     })
     assert resp.status_code == 400
@@ -193,7 +193,7 @@ def test_full_s256_flow_succeeds_with_7_day_expires_in(client):
     assert authz.status_code == 302
     code = authz.headers["location"].split("code=")[1].split("&")[0]
     resp = client.post("/oauth/token", data={
-        "grant_type": "authorization_code", "code": code, "redirect_uri": JARVIS_REDIRECT,
+        "grant_type": "authorization_code", "code": code, "client_id": "jarvis-app", "redirect_uri": JARVIS_REDIRECT,
         "code_verifier": verifier,
     })
     assert resp.status_code == 200

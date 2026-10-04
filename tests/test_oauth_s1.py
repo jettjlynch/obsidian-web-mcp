@@ -134,6 +134,7 @@ def test_full_pkce_flow_issues_a_fresh_token_not_the_static_one(monkeypatch, tmp
 
     token_resp = client.post("/oauth/token", data={
         "grant_type": "authorization_code",
+        "client_id": "jarvis-app",
         "code": code,
         "redirect_uri": JARVIS_REDIRECT,
         "code_verifier": verifier,
