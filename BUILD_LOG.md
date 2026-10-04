@@ -6,6 +6,15 @@ First-hand operational history already lives in `OPERATIONS.md` (outages, tunnel
 
 ---
 
+## 2026-10-04 ~10:15 — tests leaked into the LIVE data-layer recall log; fixed (session data-research)
+
+- **What:** added autouse fixture `_isolate_datalayer_flag` in `tests/conftest.py` (sets `DATALAYER_RERANK_VAULT_MCP=0`; `test_datalayer.py` still sets its own env per test, which wins).
+- **Why:** with the real `~/work/Scripts/data-layer/flags.json` at vault_mcp=true, every read in test_tools/test_vault etc. ran `datalayer.log_recall()` against the live `data-layer/state/recalls.jsonl`. 84 of its 86 lines were fixture paths, and the usage-decay signal was mostly test noise. This is the same class of bug as the 2026-08-30 oauth_clients.json leak.
+- **Files:** `tests/conftest.py` (backup `tests/conftest.py.bak-20261004-recallleak`). No src change, no restart.
+- **Rollback:** restore the backup (this re-opens the leak).
+- **Verified:** the old conftest reproduced the leak (+14 lines in one pytest run). With the new one: +0 lines, 287/287 pass. Log cleaned on the data-layer side (see `~/work/Scripts/data-research/BUILD_LOG.md`).
+
+
 ## Reusable capabilities
 
 Derived from module docstrings under `src/obsidian_vault_mcp/` and `scripts/` (2026-10-03).
@@ -20,7 +29,34 @@ Derived from module docstrings under `src/obsidian_vault_mcp/` and `scripts/` (2
 | Rate limiting | RATE_LIMIT_READ/WRITE enforced | calls -> 429 | `rate_limit.py` | prod |
 | Folder scoping | `VAULT_SCOPE_ROOT` makes a sub-folder the effective root, refuses escapes | env -> scoped instance | `config.py` `effective_vault_path()` | tested |
 | Frontmatter index | In-memory YAML frontmatter index across the vault | md files -> query results | `frontmatter_index.py` | prod |
-| Watchdog + Cloudflare tunnel ops | Health watchdog, tunnel setup, launchd plists | n/a | `mcp_watchdog.sh`, `scripts/setup-tunnel.sh`, `scripts/launchd/*` | prod |
+| Watchdog + Cloudflare tunnel ops | Health watchdog (RETIRED 2026-10-03, selfheal owns health restarts now), tunnel setup, launchd plists | n/a | `mcp_watchdog.sh` (kept, unloaded), `scripts/setup-tunnel.sh`, `scripts/launchd/*` | tunnel prod / watchdog retired |
+| Thread-safe sqlite store pattern | One shared sqlite3 connection (`check_same_thread=False`) with every method serialized by an RLock decorator (`_locked`), safe for watcher-thread writers plus request-thread readers | n/a | `retrieval/store.py` | prod |
+
+---
+
+## 2026-10-03 23:40-23:58 — FIX: retrieval listener SQLite thread crash loop (commit b8cf3d2, deployed)
+
+**What:** `RetrievalStore` now opens its connection with `check_same_thread=False` and serializes every method through a `threading.RLock` (`_locked` decorator). New regression test `tests/test_retrieval_store_threading.py` (cross-thread diff/apply/query/delete, plus 4 writers and 2 readers concurrently). Committed on `main` (repo practice: direct commits) as **b8cf3d2**, containing ONLY `retrieval/store.py` and the new test. The data-layer WIP below and this BUILD_LOG stay uncommitted (not mine to commit).
+**Why (root cause):** `server.py` builds the store on the main thread at startup, but `frontmatter_index._flush_pending` runs on a `threading.Timer` thread and calls the retrieval change listener, which runs `store.diff/apply`. sqlite3's default `check_same_thread=True` raised `ProgrammingError: SQLite objects created in a thread can only be used in that same thread` on EVERY listener call: 9,044 times in total, 559 on 2026-10-03, the latest at 23:41. Impact: **no edited note had been re-indexed for semantic search** (the DB file mtime was 6 Sep 18:33, the original backfill). It also produced a 391 MB, unrotated `~/Library/Logs/vault-mcp-error.log`.
+**Files touched:** `src/obsidian_vault_mcp/retrieval/store.py`, `tests/test_retrieval_store_threading.py` (new). Backups: `~/code/obsidian-web-mcp-backups/2026-10-03-sqlite-thread-fix/{store.py,BUILD_LOG.md}.bak-20261003`. Old error log: `~/Library/Logs/vault-mcp-error.log.20261003-pre-sqlite-fix.gz` (6.6 MB, kept as evidence).
+**Deploy:** ONE restart, `launchctl kickstart -k gui/501/com.jettlynch.vault-mcp` at 23:47:42 (new pid 37765). This also loaded the uncommitted data-layer hook below (its flag is off, so a no-op). That closes its PENDING restart.
+**Rollback:** `git revert b8cf3d2` (or `cp` the backup store.py back), then `launchctl kickstart -k gui/$(id -u)/com.jettlynch.vault-mcp`. Expect the ProgrammingError flood to return.
+**Verified:** the new tests failed first with the exact live error, then passed; full suite **280 passed**. Live: `/health` 200 after 8s. Public `https://vault-mcp.wzdmai.com/health` 200, OAuth metadata 200, unauthenticated `POST /mcp` 401 (auth still enforced). Zero `ProgrammingError` since the restart. The listener really writes now: `Daily/2026-10-03.md` went from 0 to 130 chunks, plus `Memory/Claude Interaction Notes.md` and 2 transcripts. The retrieval.sqlite mtime moved to 23:48-23:50, its first write since 6 Sep.
+**NOT verified:** a throwaway probe note (`zz-vault-mcp-listener-probe.md`, created then deleted) was not indexed within ~3 min. The flush was still working through the backlog of other changed files serially (Ollama embeds), and the 5s debounce resets on every vault event. This is a pre-existing latency trait, not this bug. The vault has a month of un-indexed edits: consider a one-off `scripts/reindex_vault.py` to catch up, since the incremental path only fires on new edits.
+
+---
+
+## 2026-10-03 — data-layer P3 re-rank hook (flag OFF; loaded live 23:47:42 by the sqlite-fix restart)
+
+**What:** New `src/obsidian_vault_mcp/datalayer.py`, an optional hook into Jett's data-layer ranking library (`DATALAYER_DIR`, default `~/work/Scripts/data-layer`: `rerank.py` + `recall.py`, stdlib, outside this repo). It is gated by that build's `flags.json` key `vault_mcp` (currently **false**); env `DATALAYER_RERANK_VAULT_MCP` overrides. The flag is read on every call. With the flag on: `vault_search_semantic` reorders results by type x usage-decay (score = 1 - distance) and adds `pinned_core` (notes with `pinned: true`); `vault_search` reorders ripgrep matches by their file's weight (rg order is filesystem order anyway) and adds `pinned_core`; `vault_read`/`vault_batch_read` (content reads only, successful only) append to `data-layer/state/recalls.jsonl`. With the flag off, the library missing, or any error, behaviour is exactly as before.
+**Confidence:** `no_good_answer` is computed in `retrieval/query.py` from raw distances before the hook runs, and each result keeps its raw `distance`. The hook only reorders (tested).
+**Why:** data-layer P3 (`~/work/Scripts/data-layer/HANDOFF-2026-10-03-data-layer.md`). The full entry is in `~/work/Scripts/BUILD_LOG.md` ("data-layer: P3 re-rank layer over qmd").
+**Files touched:** `src/obsidian_vault_mcp/datalayer.py` (new), `tools/search.py`, `tools/read.py`, `tests/test_datalayer.py` (new, 6 tests). Backups: `~/code/obsidian-web-mcp-backups/2026-10-03-pre-datalayer/{search.py,read.py,BUILD_LOG.md}.bak-20261003-2317-datalayer`. **Uncommitted** on top of bc06e59.
+**Rollback:** behaviour only, no restart needed once the code is loaded: `/opt/homebrew/bin/python3 ~/work/Scripts/data-layer/rerank.py flag vault_mcp off`. Code: `git checkout -- src/obsidian_vault_mcp/tools/search.py src/obsidian_vault_mcp/tools/read.py && rm src/obsidian_vault_mcp/datalayer.py tests/test_datalayer.py`, then `launchctl kickstart -k gui/$(id -u)/com.jettlynch.vault-mcp` if it had been restarted onto the new code.
+**DONE 23:47:42 (by the sqlite-fix session, entry above): restart happened, /health 200.** Original note: load the code with `launchctl kickstart -k gui/$(id -u)/com.jettlynch.vault-mcp`, then check `curl -s localhost:8420/health` returns 200. With the flag off this changes nothing beyond one flags.json read per search/read. Not done here because a restart interrupts claude.ai remote access. Note: the watchdog restarting the server would also load it (with the flag off, still a no-op).
+**Update 2026-10-04 01:40 (dl-p3):** the data-layer eval PASSED (recall@10 median general 0.380 vs 0.329 qmd_alone, track1b 0.250 vs 0.200, 5 runs). With the flag on, `vault_search_semantic` fetches `max_results x datalayer.DEPTH_FACTOR` (3) before re-ranking, then cuts back. The live process (started 23:47:42) runs this code, since files were last modified 23:25:25. On the overnight coordinator's rule the `vault_mcp` flag stays **OFF**: it is on the Jett actions list in `~/work/Scripts/BUILD_LOG.md`. To enable: `/opt/homebrew/bin/python3 ~/work/Scripts/data-layer/rerank.py flag vault_mcp on` (read per call, no restart); rollback is the same command with `off`.
+**Verified:** suite 271 -> **277 passed**. Flag off: raw order, no `pinned_core` key. Flag on: decision outranks reference, raw distances and `no_good_answer` are unchanged, an empty result stays `no_good_answer: true`, and recall is logged only on successful content reads. A missing DATALAYER_DIR means off. The tests never touch the real flags.json or recall log.
+**NOT verified:** live behaviour (not restarted); performance under load (one flags.json read plus an mtime-cached frontmatter stat per result per call).
 
 ---
 

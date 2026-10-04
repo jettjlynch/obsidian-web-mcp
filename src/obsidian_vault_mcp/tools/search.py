@@ -8,7 +8,7 @@ from pathlib import Path
 
 import frontmatter
 
-from .. import config
+from .. import config, datalayer
 from ..markdown import json_safe
 from ..vault import resolve_vault_path, resolve_vault_read_path
 
@@ -179,17 +179,24 @@ def vault_search(
         else:
             matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
 
+        # data-layer P3 (flag vault_mcp, default off): reorder by type x decay.
+        matches = datalayer.rerank_matches(matches)
+
         for match in matches:
             file_full_path = config.effective_vault_path() / match["path"]
             match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
 
         truncated = len(matches) >= max_results
 
-        return json.dumps({
+        out = {
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
-        })
+        }
+        pinned = datalayer.pinned_core()
+        if pinned is not None:
+            out["pinned_core"] = pinned
+        return json.dumps(out)
     except ValueError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
@@ -267,20 +274,27 @@ def vault_search_semantic(
     if scope_root:
         effective_prefix = f"{scope_root}/{path_prefix.lstrip('/')}" if path_prefix else scope_root
 
+    # data-layer P3: with its flag on, fetch 3x deeper so the re-rank has something
+    # to promote, then cut back to max_results. Same distance cutoff, so an empty
+    # deep fetch is exactly an empty normal fetch (no_good_answer unchanged).
+    rerank_on = datalayer.enabled()
     try:
         response = semantic_search(
             query=query,
             embedder=server.retrieval_embedder,
             store=server.retrieval_store,
             user_scope=effective_prefix or "",
-            top_k=max_results,
+            top_k=max_results * datalayer.DEPTH_FACTOR if rerank_on else max_results,
             max_distance=config.RETRIEVAL_MAX_DISTANCE,
             frontmatter_field=frontmatter_field,
             frontmatter_value=frontmatter_value,
         )
 
         results = []
-        for r in response.results:
+        # data-layer P3 (flag vault_mcp, default off): reorder only. no_good_answer
+        # and each raw `distance` below still come from the unranked response.
+        ranked = datalayer.rerank_semantic(response.results) if rerank_on else response.results
+        for r in ranked[:max_results]:
             p = r.file_path
             if scope_root:
                 if not (p == scope_root or p.startswith(scope_root + "/")):
@@ -304,6 +318,9 @@ def vault_search_semantic(
             "no_good_answer": response.no_good_answer,
             "searched_summary": response.searched_summary,
         }
+        pinned = datalayer.pinned_core()
+        if pinned is not None:
+            out["pinned_core"] = pinned
         if response.no_good_answer:
             out["note"] = (
                 "I didn't find anything in the vault covering this -- this answer "
