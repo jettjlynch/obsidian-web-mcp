@@ -505,6 +505,13 @@ def main():
     # this listener attached, same guarantee the old per-request ordering was
     # trying (unsuccessfully) to provide.
     if config.RETRIEVAL_ENABLED:
+        location_error = config.retrieval_db_location_error()
+        if location_error:
+            # Fail loudly: launchd will keep restarting and the log says why,
+            # instead of silently serving an empty semantic index.
+            logger.error(location_error)
+            raise SystemExit(location_error)
+
         from .retrieval.indexer import RetrievalIndexer
         from .retrieval.store import RetrievalStore
 
