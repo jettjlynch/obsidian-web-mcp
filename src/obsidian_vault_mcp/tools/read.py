@@ -6,7 +6,7 @@ import logging
 import frontmatter
 
 from .. import config
-from ..markdown import find_heading_section
+from ..markdown import find_heading_section, json_safe
 from ..vault import resolve_vault_path, read_file
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ def vault_read(path: str) -> str:
         try:
             post = frontmatter.loads(content)
             if post.metadata:
-                fm_data = post.metadata
+                fm_data = json_safe(post.metadata)
         except Exception:
             pass
 
@@ -93,7 +93,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             try:
                 post = frontmatter.loads(content)
                 if post.metadata:
-                    fm_data = post.metadata
+                    fm_data = json_safe(post.metadata)
             except Exception:
                 pass
 

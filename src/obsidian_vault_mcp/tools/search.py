@@ -9,6 +9,7 @@ from pathlib import Path
 import frontmatter
 
 from .. import config
+from ..markdown import json_safe
 from ..vault import resolve_vault_path, resolve_vault_read_path
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,7 @@ def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
         if not post.metadata:
             return None
         keys = list(post.metadata.keys())[:max_keys]
-        return {k: post.metadata[k] for k in keys}
+        return json_safe({k: post.metadata[k] for k in keys})
     except Exception:
         return None
 
@@ -223,8 +224,8 @@ def vault_search_frontmatter(
             title = fm.get("title", Path(path).stem)
             formatted.append({
                 "path": path,
-                "frontmatter": fm,
-                "title": title,
+                "frontmatter": json_safe(fm),
+                "title": json_safe(title),
             })
 
         truncated = len(results) > max_results
