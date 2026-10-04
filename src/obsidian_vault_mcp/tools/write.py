@@ -10,6 +10,9 @@ import logging
 
 import frontmatter
 
+from .. import frontmatter_io
+from ..frontmatter_io import YAMLError
+
 from .. import config
 from ..markdown import unified_diff
 from ..vault import resolve_vault_path, read_file, write_file_atomic
@@ -37,17 +40,24 @@ def vault_write(
 
         final_content = content
         if merge_frontmatter and existed:
+            # Port of upstream 2e2fc9e (#42), 2026-10-04: ruamel round-trip so
+            # untouched keys keep their quote style, block lists, yes/no,
+            # comments and order (python-frontmatter re-emitted all of it).
+            # Malformed YAML on either side now ABORTS (file untouched)
+            # instead of "writing as-is", which silently dropped every
+            # existing frontmatter key.
             try:
-                existing_post = frontmatter.loads(old_content)
-                new_post = frontmatter.loads(content)
-
-                merged_meta = dict(existing_post.metadata)
-                merged_meta.update(new_post.metadata)
-
-                new_post.metadata = merged_meta
-                final_content = frontmatter.dumps(new_post)
-            except Exception as e:
-                logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
+                existing_meta, _ = frontmatter_io.loads(old_content)
+                new_meta, new_body = frontmatter_io.loads(content)
+                for key, value in new_meta.items():
+                    existing_meta[key] = value
+                final_content = frontmatter_io.dumps(existing_meta, new_body)
+            except YAMLError as e:
+                return json.dumps({
+                    "error": f"Frontmatter merge aborted: malformed YAML frontmatter ({e})",
+                    "path": path,
+                    "created": False,
+                })
 
         if dry_run:
             return json.dumps({
