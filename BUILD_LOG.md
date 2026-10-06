@@ -6,6 +6,15 @@ First-hand operational history already lives in `OPERATIONS.md` (outages, tunnel
 
 ---
 
+## 2026-10-06 22:25 — vault-mcp "hang": slow read tools blocked the event loop; moved them to worker threads (agent vault-mcp-fix)
+
+- **What:** new `off_loop` decorator in `server.py`, applied between `@mcp.tool` and `@audited` on the 10 read-only tools (vault_read, vault_batch_read, vault_search, vault_search_frontmatter, vault_search_semantic, vault_list, vault_read_section, vault_links, vault_backlinks, vault_tags). It turns each into an async tool that runs the sync body via `anyio.to_thread.run_sync`. Write tools are unchanged: they stay on the loop and stay serialised. `tests/test_token_scope.py` got a `_call()` helper that awaits coroutine results. LaunchAgent restarted.
+- **Why (root cause):** FastMCP runs sync tools directly on the asyncio event loop. `vault_search_semantic` (4-7 s, Python-side search; Ollama itself answers in ~30 ms warm) and `vault_tags` (~7 s full walk) block every other request, /health and `initialize` included. Measured before the fix: /health took 2.8 s behind one semantic call. A cloud routine firing several of these at once queued them serially past claude.ai's 30 s limit, so the connector timed out. cloudflared logged bursts of "context canceled" at 21:13 and 21:17 UTC, and the server logged `ClientDisconnect` at 12:03. The Ollama embed lines were NOT the cause: about 3 calls per 15 min from the file watcher, all in its own thread, not a re-index loop. The server never actually died; the watchdog had no DOWN events today.
+- **Files:** `src/obsidian_vault_mcp/server.py` (backup `server.py.bak-20261006`), `tests/test_token_scope.py` (backup `tests/test_token_scope.py.bak-20261006`). No config, index data, cloudflared or Shaa server touched.
+- **Rollback:** `cp src/obsidian_vault_mcp/server.py.bak-20261006 src/obsidian_vault_mcp/server.py && cp tests/test_token_scope.py.bak-20261006 tests/test_token_scope.py && launchctl kickstart -k gui/$(id -u)/com.jettlynch.vault-mcp` (or `git revert` the commit).
+- **Verified:** 287/287 pytest pass. After the restart, with 3x `vault_search_semantic` plus `vault_tags` in flight (4-5 s each): /health 0.02 s, `initialize` 0.02 s, `vault_list` 0.04 s. Before the fix, /health was 2.8 s behind ONE call. Tunnel `vault_list` 0.2-0.3 s. The claude.ai Obsidian connector (`vault_list`, `vault_search_semantic`) worked end to end with correct results. The audit log still records scope and duration, which proves contextvars reach the worker thread. No new errors in the log.
+- **NOT verified:** a real cloud-routine run after the fix (the coordinator should re-run the scout). The 4-7 s semantic latency itself is not fixed, only isolated; a follow-up should profile `retrieval/query.py` and the datalayer re-rank path.
+
 ## 2026-10-04 ~10:15 — tests leaked into the LIVE data-layer recall log; fixed (session data-research)
 
 - **What:** added autouse fixture `_isolate_datalayer_flag` in `tests/conftest.py` (sets `DATALAYER_RERANK_VAULT_MCP=0`; `test_datalayer.py` still sets its own env per test, which wins).

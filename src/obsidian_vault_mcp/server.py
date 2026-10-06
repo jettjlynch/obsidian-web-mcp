@@ -20,6 +20,26 @@ from .audit import audited
 from .config import VAULT_MCP_PORT, VAULT_OAUTH_AUTHORIZE_PIN, VAULT_PATH, VAULT_SCOPE_ROOT, effective_vault_path
 from .frontmatter_index import FrontmatterIndex
 
+
+def off_loop(fn):
+    """Run a sync read-only tool in a worker thread instead of on the event loop.
+
+    FastMCP calls sync tools directly on the asyncio loop, so one slow call
+    (vault_search_semantic / vault_tags take 4-7s) stalled every other request,
+    /health and initialize included, and a few queued calls pushed claude.ai
+    past its 30s timeout (2026-10-06). functools.wraps keeps the signature
+    FastMCP builds the schema from and the audit_kind attribute; anyio copies
+    contextvars into the thread, so token_scope.current_scope still reaches
+    audited()'s gate. Write tools stay on the loop (fast, and serialised).
+    """
+    import functools
+    import anyio
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+    return wrapper
+
 logger = logging.getLogger(__name__)
 
 # Global frontmatter index instance
@@ -157,6 +177,7 @@ from .models import (
     description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_read", kind="read")
 def vault_read(path: str) -> str:
     """Read a file from the vault."""
@@ -169,6 +190,7 @@ def vault_read(path: str) -> str:
     description="Read multiple files from the vault in one call. Handles missing files gracefully.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_batch_read", kind="read")
 def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     """Read multiple files at once."""
@@ -217,6 +239,7 @@ def vault_batch_frontmatter_update(updates: list[dict], dry_run: bool = False) -
     description="Search for text across vault files. Uses ripgrep if available, falls back to Python. Returns matching lines with context and frontmatter excerpts.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_search", kind="read")
 def vault_search(
     query: str,
@@ -235,6 +258,7 @@ def vault_search(
     description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_search_frontmatter", kind="read")
 def vault_search_frontmatter(
     field: str,
@@ -260,6 +284,7 @@ def vault_search_frontmatter(
     ),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_search_semantic", kind="read")
 def vault_search_semantic(
     query: str,
@@ -281,6 +306,7 @@ def vault_search_semantic(
     description="List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. Excludes .obsidian, .trash, .git directories.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_list", kind="read")
 def vault_list(
     path: str = "",
@@ -375,6 +401,7 @@ def vault_append_under_heading(path: str, heading: str, content: str, dry_run: b
     description="Return ONLY the content under a heading (up to the next same/higher heading). Saves context on large files where you need one section, not the whole note.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_read_section", kind="read")
 def vault_read_section(path: str, heading: str) -> str:
     """Read one section of a file."""
@@ -401,6 +428,7 @@ def vault_prepend(path: str, content: str, dry_run: bool = False, create_dirs: b
     description="Return all [[wikilinks]] found in a file (outgoing links), with alias/subpath parsed and a deduped list of unique targets.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_links", kind="read")
 def vault_links(path: str) -> str:
     """List a file's outgoing wikilinks."""
@@ -413,6 +441,7 @@ def vault_links(path: str) -> str:
     description="Return all notes in the vault that link to `target` (incoming links) -- the graph view Obsidian has natively. target may be given with or without a .md suffix or folder path.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_backlinks", kind="read")
 def vault_backlinks(target: str) -> str:
     """Find notes linking to a target."""
@@ -425,6 +454,7 @@ def vault_backlinks(target: str) -> str:
     description="If tag is given: list all notes carrying that tag (frontmatter or inline #tag). If omitted: return all tags in the vault with counts, sorted by frequency.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
+@off_loop
 @audited("vault_tags", kind="read")
 def vault_tags(tag: str | None = None) -> str:
     """List notes by tag, or all tags with counts."""

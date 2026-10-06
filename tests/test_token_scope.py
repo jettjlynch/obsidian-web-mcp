@@ -21,6 +21,8 @@ findings. The legacy static token is deliberately left grandfathered to
 H-2/S2's job.
 """
 
+import asyncio
+import inspect
 import json
 import logging
 
@@ -28,6 +30,14 @@ import pytest
 
 from obsidian_vault_mcp import config, oauth, token_scope
 from obsidian_vault_mcp.audit import audited, _scope_allows
+
+
+def _call(fn, **kwargs):
+    # Read-only tools are async since 2026-10-06 (server.off_loop runs them
+    # in a worker thread); asyncio.run copies the current context, so the
+    # current_scope set by each test still reaches audited()'s gate.
+    result = fn(**kwargs)
+    return asyncio.run(result) if inspect.iscoroutine(result) else result
 
 
 # --- _scope_allows / audited() gate, unit-level (fake tools) --------------
@@ -201,7 +211,7 @@ def test_read_scope_rejected_on_every_write_class_tool(vault_dir):
         if kind != "write":
             continue
         fn = getattr(server, name)
-        result = json.loads(fn(**_MINIMAL_ARGS[name]))
+        result = json.loads(_call(fn, **_MINIMAL_ARGS[name]))
         assert "error" in result, f"{name}: expected a scope-denial error, got {result}"
         assert "requires write-scope access" in result["error"], f"{name}: {result}"
 
@@ -217,7 +227,7 @@ def test_read_scope_accepted_on_every_read_class_tool(vault_dir):
         if kind != "read":
             continue
         fn = getattr(server, name)
-        result = json.loads(fn(**_MINIMAL_ARGS[name]))
+        result = json.loads(_call(fn, **_MINIMAL_ARGS[name]))
         error = result.get("error", "") or ""
         assert "requires read-scope access" not in error, f"{name} was scope-denied: {result}"
 
@@ -230,7 +240,7 @@ def test_write_scope_accepted_on_every_write_class_tool(vault_dir):
         if kind != "write":
             continue
         fn = getattr(server, name)
-        result = json.loads(fn(**_MINIMAL_ARGS[name]))
+        result = json.loads(_call(fn, **_MINIMAL_ARGS[name]))
         error = result.get("error", "") or ""
         assert "requires write-scope access" not in error, f"{name} was scope-denied: {result}"
 
