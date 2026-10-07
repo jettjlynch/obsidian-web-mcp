@@ -1,5 +1,7 @@
 """Read boundaries must reject real hardlinks, including bytes already read by rg."""
 
+import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -12,6 +14,12 @@ from obsidian_vault_mcp.tools import search
 
 requires_rg = pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
 SECRET = "SECRET hunter2 token"
+
+
+def _call(fn, *args):
+    # Read-only tools are async since bb19912 (server.off_loop runs them in a worker thread).
+    result = fn(*args)
+    return asyncio.run(result) if inspect.iscoroutine(result) else result
 CONTENT = f"---\nsecret: {SECRET}\n---\nbefore\n{SECRET}\nafter\n"
 
 
@@ -43,14 +51,14 @@ def test_registered_search_drops_refused_file(vault_dir, refused_file, backend):
             capture_output=True, text=True, check=True,
         )
         assert SECRET in raw.stdout
-    result = json.loads(server.vault_search(SECRET))
+    result = json.loads(_call(server.vault_search, SECRET))
     assert result["results"] == []
     assert result["total_matches"] == 0
     assert SECRET not in json.dumps(result)
 
 
 def test_registered_read_refuses_file(vault_dir, refused_file):
-    result = json.loads(server.vault_read(refused_file.name))
+    result = json.loads(_call(server.vault_read, refused_file.name))
     assert "error" in result
     assert "content" not in result
     assert SECRET not in json.dumps(result)
@@ -66,10 +74,10 @@ def test_single_link_file_still_reads_and_matches(vault_dir, backend):
     target = vault_dir / "ordinary.md"
     target.write_text(CONTENT, encoding="utf-8")
     assert target.stat().st_nlink == 1
-    read = json.loads(server.vault_read(target.name))
+    read = json.loads(_call(server.vault_read, target.name))
     assert read["content"] == CONTENT
     assert read["frontmatter"] == {"secret": SECRET}
-    result = json.loads(server.vault_search(SECRET))
+    result = json.loads(_call(server.vault_search, SECRET))
     assert result["total_matches"] == 2
     assert all(match["path"] == target.name for match in result["results"])
     assert all(SECRET in match["match_context"] for match in result["results"])
@@ -93,7 +101,7 @@ def test_registered_search_excerpt_rechecks_file(vault_dir, tmp_path, backend, m
         return matches
 
     monkeypatch.setattr(search, backend_name, search_then_replace)
-    result = json.loads(server.vault_search("public match"))
+    result = json.loads(_call(server.vault_search, "public match"))
     assert result["results"][0]["frontmatter_excerpt"] is None
     assert SECRET not in json.dumps(result)
 
