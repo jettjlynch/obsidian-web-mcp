@@ -6,6 +6,14 @@ First-hand operational history already lives in `OPERATIONS.md` (outages, tunnel
 
 ---
 
+## 2026-10-07 08:23 — DEPLOYED merge/upstream-2026-10-04 onto main (with bb19912) + retrieval index moved (session jarvis-deploy)
+
+- **What:** `fcb7acb` merges `merge/upstream-2026-10-04` (12 upstream security/bug ports, data-layer, `7da3686` index default `~/.config/vault-mcp/`) into main; `ba0422b` makes `tests/test_hardlink_reads.py` await the async read tools (test-only). Index APFS-cloned to `~/.config/vault-mcp/retrieval.sqlite` while the server was booted out; the legacy `~/.config/prouds-mcp/retrieval.sqlite` is kept for rollback. Pushed to fork `jett-local-security-fixes`.
+- **Why:** Jett approved the deploy ("Approve all", 7 Oct). Without the index move, 7da3686 refuses to start.
+- **Rollback:** `launchctl bootout gui/501/com.jettlynch.vault-mcp; git revert -m 1 fcb7acb` (pushed, so revert, not reset), then bootstrap. bb19912 reads the legacy index path, which still exists.
+- **Verified:** 378/378 pytest pass; /health ok; lsof shows the new index path; authenticated initialize + tools/list (21 tools) locally and through the tunnel; claude.ai Obsidian connector vault_list + vault_search_semantic OK; no errors since the restart. Cloudflare bans the `Python-urllib` user-agent (Error 1010), so set a User-Agent in probes.
+- **Not verified:** the weekend newsletter routines.
+
 ## 2026-10-06 22:25 — vault-mcp "hang": slow read tools blocked the event loop; moved them to worker threads (agent vault-mcp-fix)
 
 - **What:** new `off_loop` decorator in `server.py`, applied between `@mcp.tool` and `@audited` on the 10 read-only tools (vault_read, vault_batch_read, vault_search, vault_search_frontmatter, vault_search_semantic, vault_list, vault_read_section, vault_links, vault_backlinks, vault_tags). It turns each into an async tool that runs the sync body via `anyio.to_thread.run_sync`. Write tools are unchanged: they stay on the loop and stay serialised. `tests/test_token_scope.py` got a `_call()` helper that awaits coroutine results. LaunchAgent restarted.
