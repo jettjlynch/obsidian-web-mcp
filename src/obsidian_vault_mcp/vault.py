@@ -3,11 +3,36 @@
 import fnmatch
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+
+
+def _publish_mode(target: Path, tmp_fd: int) -> None:
+    """Give the about-to-be-published temp file the mode a normal write would produce.
+
+    tempfile.mkstemp() always creates its file 0600 (a temp-file security default),
+    ignoring the process umask; that mode would otherwise survive the os.replace and
+    silently downgrade every file the server writes -- breaking sync daemons / other
+    readers and clobbering an existing note's permissions on each edit.
+
+    Overwriting an existing file: keep that file's current mode (a write must not change
+    permissions). New file: reproduce open()'s default, 0666 & ~umask. We fchmod the fd,
+    not the path, so this can't be raced onto a symlinked target between here and replace.
+    A no-op on platforms without fchmod (Windows), where mode bits are meaningless.
+    """
+    if not hasattr(os, "fchmod"):
+        return
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    os.fchmod(tmp_fd, mode)
 
 
 def resolve_vault_path(relative_path: str) -> Path:
@@ -36,6 +61,19 @@ def resolve_vault_path(relative_path: str) -> Path:
     return resolved
 
 
+def resolve_vault_read_path(relative_path: str) -> Path:
+    """Resolve a readable vault path; even legitimate in-vault hardlinks are unsupported.
+
+    Raise ValueError on a security refusal, never a benign empty-read sentinel.
+    """
+    path = resolve_vault_path(relative_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Not a file: {relative_path}")
+    if path.stat().st_nlink > 1:
+        raise ValueError(f"Refusing hardlinked file: {relative_path}")
+    return path
+
+
 def _iso_timestamp(ts: float) -> str:
     """Convert a Unix timestamp to an ISO 8601 string in UTC."""
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -46,10 +84,7 @@ def read_file(relative_path: str) -> tuple[str, dict]:
 
     Metadata keys: size (int), modified (ISO str), created (ISO str).
     """
-    path = resolve_vault_path(relative_path)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Not a file: {relative_path}")
+    path = resolve_vault_read_path(relative_path)
 
     stat = path.stat()
     content = path.read_text(encoding="utf-8")
@@ -88,6 +123,7 @@ def write_file_atomic(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(encoded)
+            _publish_mode(path, f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         # Clean up the temp file on any failure

@@ -160,13 +160,42 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")
 
 # Sits outside the vault, same convention as other out-of-vault state: one
-# file to back up, delete-and-rebuild, or point a health-check at. This is
-# the SAME path prouds-mcp's port of this feature uses -- deliberately, so
-# the real index already built there (11,293 files, 297,479 chunks) is
-# picked up here as-is rather than triggering a fresh reindex.
-RETRIEVAL_DB_PATH = Path(
-    os.environ.get("RETRIEVAL_DB_PATH", os.path.expanduser("~/.config/prouds-mcp/retrieval.sqlite"))
+# file to back up, delete-and-rebuild, or point a health-check at.
+# 2026-10-04: default moved from ~/.config/prouds-mcp/retrieval.sqlite (a
+# Prouds-named, client-locked directory -- it was shared with prouds-mcp's
+# port so the already-built index was reused) to ~/.config/vault-mcp/. The env
+# override still wins. If the new default is missing but the legacy file
+# exists, startup refuses (retrieval_db_location_error) rather than silently
+# creating an empty index and serving no semantic results.
+RETRIEVAL_DB_PATH_DEFAULT = Path(os.path.expanduser("~/.config/vault-mcp/retrieval.sqlite"))
+RETRIEVAL_DB_PATH_LEGACY = Path(os.path.expanduser("~/.config/prouds-mcp/retrieval.sqlite"))
+RETRIEVAL_DB_PATH_FROM_ENV = bool(os.environ.get("RETRIEVAL_DB_PATH", "").strip())
+RETRIEVAL_DB_PATH = (
+    Path(os.environ["RETRIEVAL_DB_PATH"]) if RETRIEVAL_DB_PATH_FROM_ENV else RETRIEVAL_DB_PATH_DEFAULT
 )
+
+
+def retrieval_db_location_error(
+    db_path: Path | None = None,
+    legacy_path: Path | None = None,
+    from_env: bool | None = None,
+) -> str | None:
+    """Return a fatal message if the index sits only at the legacy location.
+
+    None when fine: an explicit RETRIEVAL_DB_PATH, the default already present,
+    or no legacy index either (a genuinely fresh install).
+    """
+    db_path = RETRIEVAL_DB_PATH if db_path is None else db_path
+    legacy_path = RETRIEVAL_DB_PATH_LEGACY if legacy_path is None else legacy_path
+    from_env = RETRIEVAL_DB_PATH_FROM_ENV if from_env is None else from_env
+    if from_env or db_path.exists() or not legacy_path.exists():
+        return None
+    return (
+        f"Retrieval index not found at {db_path}, but a legacy index exists at "
+        f"{legacy_path}. Refusing to start with an empty index. Stop the server, then: "
+        f"mkdir -p {db_path.parent} && mv {legacy_path}* {db_path.parent}/ "
+        f"(moves -wal/-shm too), or set RETRIEVAL_DB_PATH explicitly."
+    )
 
 # nomic-embed-text (Apache-2.0, retrieval-tuned, ~274MB, CPU-friendly) is the
 # local default -- dimension 768, confirmed live against a real `ollama pull`

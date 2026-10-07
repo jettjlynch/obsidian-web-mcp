@@ -53,6 +53,11 @@ def main() -> None:
         logger.error(f"VAULT_PATH does not exist: {config.VAULT_PATH}")
         sys.exit(1)
 
+    location_error = config.retrieval_db_location_error()
+    if location_error:
+        logger.error(location_error)
+        sys.exit(1)
+
     config.RETRIEVAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Vault:      {config.VAULT_PATH}")
     logger.info(f"Index db:   {config.RETRIEVAL_DB_PATH}")

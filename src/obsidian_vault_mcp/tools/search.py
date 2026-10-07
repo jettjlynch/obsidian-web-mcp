@@ -10,7 +10,7 @@ import frontmatter
 
 from .. import config, datalayer
 from ..markdown import json_safe
-from ..vault import resolve_vault_path
+from ..vault import resolve_vault_path, resolve_vault_read_path
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,6 @@ def _search_ripgrep(
         return []
 
     matches = []
-    current_match = None
 
     for line in result.stdout.splitlines():
         try:
@@ -67,7 +66,10 @@ def _search_ripgrep(
             file_path = match_data["path"]["text"]
             try:
                 rel_path = str(Path(file_path).relative_to(config.effective_vault_path()))
-            except ValueError:
+                # rg has already read the bytes. A refusal must discard its match,
+                # not fall back to the line in the JSON event.
+                resolve_vault_read_path(rel_path)
+            except (ValueError, OSError):
                 continue
 
             line_number = match_data["line_number"]
@@ -109,8 +111,10 @@ def _search_python(
             continue
 
         try:
-            content = file_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, PermissionError):
+            rel_path = str(file_path.relative_to(config.effective_vault_path()))
+            safe_path = resolve_vault_read_path(rel_path)
+            content = safe_path.read_text(encoding="utf-8")
+        except (ValueError, OSError):
             continue
 
         lines = content.splitlines()
@@ -119,11 +123,6 @@ def _search_python(
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
                 context = "\n".join(lines[start:end])
-
-                try:
-                    rel_path = str(file_path.relative_to(config.effective_vault_path()))
-                except ValueError:
-                    continue
 
                 matches.append({
                     "path": rel_path,
@@ -140,7 +139,9 @@ def _search_python(
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
     """Read frontmatter from a file, returning first N key-value pairs."""
     try:
-        content = file_path.read_text(encoding="utf-8")
+        rel_path = str(file_path.relative_to(config.effective_vault_path()))
+        safe_path = resolve_vault_read_path(rel_path)
+        content = safe_path.read_text(encoding="utf-8")
         post = frontmatter.loads(content)
         if not post.metadata:
             return None
