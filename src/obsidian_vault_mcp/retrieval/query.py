@@ -31,7 +31,7 @@ DEFAULT_TOP_K = 10
 #
 # 0.85, empirically calibrated (2026-09-06) against nomic-embed-text's real
 # distance distribution on Jett's actual vault, not a generic guess: genuine
-# matches for real queries ("how is the Avanti internship going" -> Avanti.md)
+# matches for real queries ("how is the ClientCo internship going" -> ClientCo.md)
 # landed at 0.69-0.78; deliberately absurd/unrelated queries ("boiling point
 # of liquid nitrogen on Jupiter") landed at 0.87-0.94. An earlier default of
 # 0.6 sat entirely below the real relevant-match range, silently forcing
