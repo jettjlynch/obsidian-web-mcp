@@ -1,9 +1,9 @@
 """Real-subprocess regression test for the 2026-09-06/07 lifespan re-entry fix
-(see LIFESPAN-INIT-DESIGN.md). Adapted from prouds-mcp's
+(see LIFESPAN-INIT-DESIGN.md). Adapted from client-mcp's
 tests/test_frontmatter_index_lifecycle.py (commit b8c199e, 2026-08-03), which
 diagnosed and fixed the identical bug in that sibling codebase -- fitted here
 to this repo's actual auth model (PIN-gated OAuth consent + per-client
-scoped tokens, not prouds-mcp's multi-user PROUDS_USERS_FILE).
+scoped tokens, not client-mcp's multi-user CLIENT_USERS_FILE).
 
 Starts a REAL server subprocess (real uvicorn, real watchdog.Observer, real
 process boundary) rather than testing any piece in isolation, because the bug
@@ -130,7 +130,7 @@ async def _one_real_mcp_call(port: int, token: str) -> dict:
 
 def test_server_stays_responsive_under_concurrent_requests(live_server):
     """The real-world reproduction: fire a burst of concurrent real MCP
-    requests (the exact trigger that pegged prouds-mcp at 100% CPU and hung
+    requests (the exact trigger that pegged client-mcp at 100% CPU and hung
     it on 2026-08-03) and confirm the server stays responsive throughout,
     with no fsevents 'already scheduled' collision in its log."""
     port, token, log_path = live_server

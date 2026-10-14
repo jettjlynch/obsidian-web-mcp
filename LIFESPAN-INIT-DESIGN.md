@@ -56,12 +56,12 @@ added an idempotency guard inside `FrontmatterIndex.start()` itself
 (`if self._observer is not None: return`), used `atexit.register(frontmatter_index.stop)`
 for cleanup. Verified live: "index builds exactly once across multiple MCP requests."
 
-**b) `prouds-mcp` (Jett's own fork) commit `b8c199e`** (3 Aug 2026): same root cause,
+**b) `client-mcp` (Jett's own fork) commit `b8c199e`** (3 Aug 2026): same root cause,
 found via a **live production hang** — a burst of ~10 concurrent MCP handshakes pegged
 the server at 100% CPU and stopped it responding to anything, confirmed with a real
 `faulthandler` thread dump. Fixed by moving `frontmatter_index.start()`/`.stop()` into
 `main()`, wrapped in `try/finally` around `uvicorn.run()` (not `atexit` — see §3 for why
-this repo should follow `prouds-mcp`'s pattern, not upstream's, on that specific point).
+this repo should follow `client-mcp`'s pattern, not upstream's, on that specific point).
 Also found and fixed a **second, independent bug** in the same investigation:
 `AuditMiddleware.replay()` (an ASGI `receive()` substitute for request-body buffering)
 never signaled `http.disconnect`, turning the downstream SSE session handler's
@@ -72,7 +72,7 @@ shim; grepped the whole `src/` tree for `replay`/`http.disconnect`/`more_body` �
 matches. `auth.py`'s `BearerAuthMiddleware` passes the original `receive` straight
 through unmodified. One less thing to fix, confirmed rather than assumed.
 
-`prouds-mcp` also has a real, subprocess-based regression test for exactly this class of
+`client-mcp` also has a real, subprocess-based regression test for exactly this class of
 bug: `tests/test_frontmatter_index_lifecycle.py` — spins up a real server subprocess,
 opens overlapping MCP handshakes, asserts the server stays responsive. This is the right
 verification shape (§5) and I'm adapting it here rather than inventing a new one.
@@ -89,7 +89,7 @@ Investigated, not assumed:
   argument *for* statelessness (no server-side session state needed across multiple
   instances) doesn't apply here either way — it's neutral, not a point in favor of
   keeping it, but also not a reason to drop it.
-- Both prior fixes (upstream and `prouds-mcp`) chose to **keep** `stateless_http=True`
+- Both prior fixes (upstream and `client-mcp`) chose to **keep** `stateless_http=True`
   and fix the init-placement bug instead of switching modes. Neither considered
   switching modes as the fix, in two independent investigations of the identical root
   cause. That's real signal, not just precedent for its own sake.
@@ -106,7 +106,7 @@ initialization code lives, not the transport mode.
 
 ## 4. Item 2 — one-time init design
 
-Adopt `prouds-mcp`'s pattern (`try/finally` in `main()`), not upstream's (`atexit`):
+Adopt `client-mcp`'s pattern (`try/finally` in `main()`), not upstream's (`atexit`):
 `atexit` handlers can be skipped or run in a surprising order under `SIGKILL`,
 multiprocessing, or certain exception paths; a `try/finally` wrapped directly around
 `uvicorn.run()` in `main()` guarantees the teardown call happens exactly when this
@@ -193,9 +193,9 @@ plan — happy to add it, just wasn't the default given nothing left to race wit
 
 ## 7. Verification plan (before this is called done)
 
-Matching prouds-mcp's rigor, not less:
+Matching client-mcp's rigor, not less:
 
-1. **Adapt `tests/test_frontmatter_index_lifecycle.py`** from `prouds-mcp` into this
+1. **Adapt `tests/test_frontmatter_index_lifecycle.py`** from `client-mcp` into this
    repo: real server subprocess, real overlapping MCP handshakes sent concurrently,
    assert the server stays responsive and the "already scheduled" error never appears
    in its log.
@@ -221,7 +221,7 @@ Matching prouds-mcp's rigor, not less:
 
 ## 8. Explicitly out of scope for this fix
 
-- `prouds-mcp`'s bug #2 (`AuditMiddleware.replay()`) — confirmed not present here (§2).
+- `client-mcp`'s bug #2 (`AuditMiddleware.replay()`) — confirmed not present here (§2).
 - The pre-existing `origin/main` divergence (24 unmerged upstream commits) — unrelated,
   already tracked separately.
 - Any change to `stateless_http` mode itself (§3 — explicitly recommends against).

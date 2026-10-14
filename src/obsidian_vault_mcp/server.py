@@ -74,7 +74,7 @@ async def lifespan(server):
     server-wide resources with no reason to be tied to a per-request session
     -- they now start once in main() and stop once there too (see
     LIFESPAN-INIT-DESIGN.md for the full design and prior-art citations:
-    upstream jimprosser/obsidian-web-mcp#28 and prouds-mcp's b8c199e, both of
+    upstream jimprosser/obsidian-web-mcp#28 and client-mcp's b8c199e, both of
     which hit this same class of bug independently and fixed it the same way).
     """
     yield {}
@@ -622,7 +622,7 @@ def main():
     # try/finally, not atexit: guarantees frontmatter_index/retrieval_store
     # teardown happens exactly when this process's serving loop actually
     # ends (clean exit or exception), with no dependency on interpreter
-    # shutdown timing -- prouds-mcp's b8c199e pattern, chosen over upstream's
+    # shutdown timing -- client-mcp's b8c199e pattern, chosen over upstream's
     # atexit.register() for that reason (see LIFESPAN-INIT-DESIGN.md §4).
     try:
         uvicorn.run(

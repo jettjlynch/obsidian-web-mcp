@@ -36,7 +36,7 @@ VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-clien
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 
 # PIN required to approve a new OAuth client at /oauth/authorize. Added
-# 2026-08-17 after auditing prouds-mcp's SECURITY.md: without this, /oauth/authorize
+# 2026-08-17 after auditing client-mcp's SECURITY.md: without this, /oauth/authorize
 # auto-approved ANY caller (no login, no consent page), so anyone who knew this
 # server's hostname could complete register -> authorize -> token and obtain the
 # real VAULT_MCP_TOKEN in two unauthenticated requests -- PKCE alone doesn't stop
@@ -161,14 +161,14 @@ VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")
 
 # Sits outside the vault, same convention as other out-of-vault state: one
 # file to back up, delete-and-rebuild, or point a health-check at.
-# 2026-10-04: default moved from ~/.config/prouds-mcp/retrieval.sqlite (a
-# Prouds-named, client-locked directory -- it was shared with prouds-mcp's
+# 2026-10-04: default moved from ~/.config/client-mcp/retrieval.sqlite (a
+# Client-named, client-locked directory -- it was shared with client-mcp's
 # port so the already-built index was reused) to ~/.config/vault-mcp/. The env
 # override still wins. If the new default is missing but the legacy file
 # exists, startup refuses (retrieval_db_location_error) rather than silently
 # creating an empty index and serving no semantic results.
 RETRIEVAL_DB_PATH_DEFAULT = Path(os.path.expanduser("~/.config/vault-mcp/retrieval.sqlite"))
-RETRIEVAL_DB_PATH_LEGACY = Path(os.path.expanduser("~/.config/prouds-mcp/retrieval.sqlite"))
+RETRIEVAL_DB_PATH_LEGACY = Path(os.path.expanduser("~/.config/client-mcp/retrieval.sqlite"))
 RETRIEVAL_DB_PATH_FROM_ENV = bool(os.environ.get("RETRIEVAL_DB_PATH", "").strip())
 RETRIEVAL_DB_PATH = (
     Path(os.environ["RETRIEVAL_DB_PATH"]) if RETRIEVAL_DB_PATH_FROM_ENV else RETRIEVAL_DB_PATH_DEFAULT

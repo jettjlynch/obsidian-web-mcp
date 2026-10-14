@@ -4,7 +4,7 @@ gets exposed alongside `vault_search` and `vault_search_frontmatter`
 two, not replacing them).
 
 This server is single-tenant: there's no per-request identity/scope like
-prouds-mcp's multi-user model (no identity.py, no UserContext). Folder
+client-mcp's multi-user model (no identity.py, no UserContext). Folder
 scoping here is the process-wide VAULT_SCOPE_ROOT, exactly like every other
 tool in tools/search.py -- so scoping tests monkeypatch `config.VAULT_SCOPE_ROOT`
 rather than setting a per-request user, matching tests/test_scope.py's own

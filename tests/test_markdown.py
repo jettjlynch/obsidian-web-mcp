@@ -82,10 +82,10 @@ def test_link_target_key():
 
 
 def test_extract_tags_frontmatter_and_inline():
-    md = {"tags": ["project", "avanti"]}
+    md = {"tags": ["project", "clientco"]}
     body = "Working on #phoenix3 and #ai/agents today. Not a ## heading.\n"
     tags = extract_tags(md, body)
-    assert tags == ["ai/agents", "avanti", "phoenix3", "project"]
+    assert tags == ["ai/agents", "clientco", "phoenix3", "project"]
 
 
 def test_extract_tags_string_frontmatter():

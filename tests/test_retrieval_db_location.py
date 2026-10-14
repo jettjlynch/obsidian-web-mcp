@@ -1,7 +1,7 @@
-"""2026-10-04: retrieval index default moved out of the Prouds-named directory.
+"""2026-10-04: retrieval index default moved out of the Client-named directory.
 
 Default is now ~/.config/vault-mcp/retrieval.sqlite; RETRIEVAL_DB_PATH still
-wins; if only the legacy ~/.config/prouds-mcp/retrieval.sqlite exists, startup
+wins; if only the legacy ~/.config/client-mcp/retrieval.sqlite exists, startup
 refuses instead of silently creating an empty index.
 """
 
@@ -13,9 +13,9 @@ from pathlib import Path
 from obsidian_vault_mcp import config
 
 
-def test_default_is_vault_mcp_dir_not_prouds():
+def test_default_is_vault_mcp_dir_not_client():
     assert config.RETRIEVAL_DB_PATH_DEFAULT == Path(os.path.expanduser("~/.config/vault-mcp/retrieval.sqlite"))
-    assert "prouds" not in str(config.RETRIEVAL_DB_PATH_DEFAULT)
+    assert "client" not in str(config.RETRIEVAL_DB_PATH_DEFAULT)
 
 
 def _config_in_subprocess(home: Path, extra_env: dict) -> str:
@@ -36,7 +36,7 @@ def test_env_override_wins(tmp_path):
 
 
 def test_error_when_only_legacy_exists(tmp_path):
-    new, legacy = tmp_path / "vault-mcp" / "r.sqlite", tmp_path / "prouds-mcp" / "r.sqlite"
+    new, legacy = tmp_path / "vault-mcp" / "r.sqlite", tmp_path / "client-mcp" / "r.sqlite"
     legacy.parent.mkdir()
     legacy.write_bytes(b"x")
     msg = config.retrieval_db_location_error(new, legacy, from_env=False)
@@ -54,8 +54,8 @@ def test_no_error_when_new_exists_or_fresh_install_or_env(tmp_path):
 
 def test_server_startup_refuses_with_only_legacy_index(tmp_path):
     home = tmp_path / "home"
-    (home / ".config" / "prouds-mcp").mkdir(parents=True)
-    (home / ".config" / "prouds-mcp" / "retrieval.sqlite").write_bytes(b"legacy")
+    (home / ".config" / "client-mcp").mkdir(parents=True)
+    (home / ".config" / "client-mcp" / "retrieval.sqlite").write_bytes(b"legacy")
     vault = tmp_path / "vault"
     vault.mkdir()
     env = {"HOME": str(home), "PATH": os.environ.get("PATH", ""), "VAULT_PATH": str(vault),
