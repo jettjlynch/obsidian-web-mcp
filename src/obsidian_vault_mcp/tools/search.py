@@ -248,7 +248,7 @@ def vault_search_semantic(
     """Meaning-based search over vault content.
 
     This server is single-tenant (no per-request identity/scope like
-    prouds-mcp's multi-user model): the process-wide VAULT_SCOPE_ROOT is the
+    client-mcp's multi-user model): the process-wide VAULT_SCOPE_ROOT is the
     only folder-scoping in play, same as vault_search and
     vault_search_frontmatter above -- so, like them, this passes it straight
     through into the store's own query-time filter (RETRIEVAL-DESIGN.md

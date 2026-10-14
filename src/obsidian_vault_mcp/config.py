@@ -36,7 +36,7 @@ VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-clien
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 
 # PIN required to approve a new OAuth client at /oauth/authorize. Added
-# 2026-08-17 after auditing prouds-mcp's SECURITY.md: without this, /oauth/authorize
+# 2026-08-17 after auditing client-mcp's SECURITY.md: without this, /oauth/authorize
 # auto-approved ANY caller (no login, no consent page), so anyone who knew this
 # server's hostname could complete register -> authorize -> token and obtain the
 # real VAULT_MCP_TOKEN in two unauthenticated requests -- PKCE alone doesn't stop
@@ -153,11 +153,11 @@ VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")
 
 # Sits outside the vault, same convention as other out-of-vault state: one
 # file to back up, delete-and-rebuild, or point a health-check at. This is
-# the SAME path prouds-mcp's port of this feature uses -- deliberately, so
+# the SAME path client-mcp's port of this feature uses -- deliberately, so
 # the real index already built there (11,293 files, 297,479 chunks) is
 # picked up here as-is rather than triggering a fresh reindex.
 RETRIEVAL_DB_PATH = Path(
-    os.environ.get("RETRIEVAL_DB_PATH", os.path.expanduser("~/.config/prouds-mcp/retrieval.sqlite"))
+    os.environ.get("RETRIEVAL_DB_PATH", os.path.expanduser("~/.config/client-mcp/retrieval.sqlite"))
 )
 
 # nomic-embed-text (Apache-2.0, retrieval-tuned, ~274MB, CPU-friendly) is the

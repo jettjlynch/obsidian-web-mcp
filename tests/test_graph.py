@@ -54,12 +54,12 @@ def test_vault_backlinks_with_md_suffix_and_path(vault_dir):
 # ---------- vault_tags ----------
 
 def test_vault_tags_all_counts(vault_dir):
-    (vault_dir / "t1.md").write_text("---\ntags: [project, avanti]\n---\nbody #phoenix3\n")
+    (vault_dir / "t1.md").write_text("---\ntags: [project, clientco]\n---\nbody #phoenix3\n")
     (vault_dir / "t2.md").write_text("body with #project inline\n")
     r = json.loads(vault_tags())
     counts = {entry["tag"]: entry["count"] for entry in r["tags"]}
     assert counts["project"] == 2  # frontmatter in t1 + inline in t2
-    assert counts["avanti"] == 1
+    assert counts["clientco"] == 1
     assert counts["phoenix3"] == 1
 
 

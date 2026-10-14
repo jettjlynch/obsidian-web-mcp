@@ -27,14 +27,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 logging.basicConfig(level=logging.WARNING)
 
-# 20 real queries about Jett's actual vault content (Avanti/Kyle/Debbie work,
+# 20 real queries about Jett's actual vault content (ClientCo/the client lead/a colleague work,
 # HTS/Seth Lloyd pipeline, TWR podcast, business admin, personal Insights/
 # Daily reflection notes), deliberately phrased in different words than the
 # notes themselves use -- exact-keyword grep is expected to miss several of
 # these; that gap is exactly what semantic search is for.
 QUERIES = [
-    "what did we agree with Kyle about Phoenix 3",
-    "how is the Avanti internship going",
+    "what did we agree with the client lead about Phoenix 3",
+    "how is the ClientCo internship going",
     "what's the status of Seth Lloyd as a prospect",
     "any notes on pricing the high ticket offer",
     "what guests are lined up for the podcast",
@@ -42,7 +42,7 @@ QUERIES = [
     "did I ever write about feeling insecure or black and white thinking",
     "what happened in therapy recently",
     "notes on the Japan trip planning",
-    "what's Debbie's role at Avanti",
+    "what's a colleague's role at ClientCo",
     "anything about the vault-mcp security audit findings",
     "did I decide anything about the archive UID bug",
     "what's the plan for the Hawk workstream access model",
